@@ -41,22 +41,6 @@ fn vertex(pos: [i8; 3], tc:[i8; 2]) -> Vertex {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct PushConstant {
-    _zoom: f32,
-    _offset: [f32; 2],
-    _pad: f32,
-}
-
-fn push_constant(zoom: f32, offset: [f32; 2]) -> PushConstant {
-    PushConstant {
-        _zoom: zoom,
-        _offset: offset,
-        _pad: 0.0
-    }
-}
-
 fn create_test_mesh() -> (Vec<Vertex>, Vec<u16>) {
     let vertex_data = [
         // top (0, 0, 1)
@@ -124,10 +108,10 @@ fn create_mandelbrot_texture(size: usize) -> Vec<u8>{
         .collect()
 }
 
-fn create_test_camera(aspect_ratio: f32, pos: f32) -> cgmath::Matrix4<f32> {
+fn create_test_camera(aspect_ratio: f32) -> cgmath::Matrix4<f32> {
     let proj = cgmath::perspective(cgmath::Deg(45f32), aspect_ratio, 1.0, 10.0);
     let view = cgmath::Matrix4::look_at(
-        cgmath::Point3::new(pos, -5.0, 3.0),
+        cgmath::Point3::new(1.5f32, -5.0, 3.0),
         cgmath::Point3::new(0f32, 0.0, 0.0),
         cgmath::Vector3::unit_z(),
     );
@@ -155,16 +139,13 @@ async fn setup (window: &Window) -> Handle {
         .await
        .unwrap();
 
+    //TODO: Support features
     let optional_features = wgpu::Features::empty();
-    let required_features = 
-        wgpu::Features::default() | wgpu::Features::PUSH_CONSTANTS;
-
+    let required_features = wgpu::Features::default();
     let adapter_features = adapter.features();
 
-    let required_limits = wgpu::Limits {
-        max_push_constant_size: 16,
-        ..wgpu::Limits::default()
-    };
+    //TODO: Support limits
+    let required_limits = wgpu::Limits::default();
 
     let trace_dir = std::env::var("WGPU_TRACE");
     
@@ -192,31 +173,20 @@ async fn setup (window: &Window) -> Handle {
     }
 }
 
-fn update_camera(
+fn resize(
     swapchain_desc: &wgpu::SwapChainDescriptor,
+    _device: &wgpu::Device,
     queue: &wgpu::Queue,
-    camera_buf: &wgpu::Buffer,
-    camera_state: f32
+    camera_buf: &wgpu::Buffer
 ) {
     let camera = create_test_camera(
-        swapchain_desc.width as f32 / swapchain_desc.height as f32,
-        camera_state,
+        swapchain_desc.width as f32 / swapchain_desc.height as f32
     );
     let camera_ref: &[f32;16] = camera.as_ref();
     queue.write_buffer(&camera_buf, 0, bytemuck::cast_slice(camera_ref));
 }
 
-fn resize(
-    swapchain_desc: &wgpu::SwapChainDescriptor,
-    _device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    camera_buf: &wgpu::Buffer,
-    camera_state: f32,
-) {
-    update_camera(swapchain_desc, queue, camera_buf, camera_state);
-}
-
-fn render<T:Pod>(
+fn render(
     frame: &wgpu::SwapChainTexture,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -225,7 +195,6 @@ fn render<T:Pod>(
     vertex_buf: &wgpu::Buffer,
     index_buf: &wgpu::Buffer,
     index_cnt: usize,
-    push_constants: T,
     _spawner: &impl futures::task::LocalSpawn,
 ) {
     let mut encoder = device
@@ -252,7 +221,6 @@ fn render<T:Pod>(
     renderpass.set_bind_group(0, &bind_group, &[]);
     renderpass.set_index_buffer(index_buf.slice(..));
     renderpass.set_vertex_buffer(0, vertex_buf.slice(..));
-    renderpass.set_push_constants(wgpu::ShaderStage::FRAGMENT, 0, bytemuck::cast_slice(&[push_constants]));
     renderpass.pop_debug_group();
     renderpass.insert_debug_marker("Drawing frame");
     renderpass.draw_indexed(0..index_cnt as u32, 0, 0..1);
@@ -323,10 +291,7 @@ fn main() {
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[wgpu::PushConstantRange {
-                stages: wgpu::ShaderStage::FRAGMENT,
-                range: (0..16),
-            }],
+            push_constant_ranges: &[],
         }
     );
 
@@ -403,7 +368,7 @@ fn main() {
         usage: wgpu::BufferUsage::INDEX,
     });
 
-    let size = 8192u32;
+    let size = 256u32;
     let texels = create_mandelbrot_texture(size as usize);
     let texture_extent = wgpu::Extent3d {
         width: size,
@@ -447,8 +412,7 @@ fn main() {
     });
 
     let camera = create_test_camera(
-        swapchain_desc.width as f32 / swapchain_desc.height as f32,
-        0.0,
+        swapchain_desc.width as f32 / swapchain_desc.height as f32
     );
     let camera_ref: &[f32; 16] = camera.as_ref();
     let uniform_buf: wgpu::Buffer = h.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -511,9 +475,6 @@ fn main() {
     let mut last_frame = std::time::Instant::now();
     let mut show_demo = true;
     let mut last_cursor = None;
-    let mut camera_state: f32 = 0.0;
-    let mut zoom: f32 = 0.1;
-    let mut offset: [f32; 2] = [0.0, 0.0];
 
     log::info!("Starting event loop!");
     let (_pool, spawner) = {
@@ -533,12 +494,12 @@ fn main() {
         
         // Set control flow to wait min(next event, 10ms) 
         *control_flow =
-            ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1));
+            ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(10));
 
         // Process events
         match event {
             Event::MainEventsCleared => {
-                if last_update_inst.elapsed() > Duration::from_millis(2) {
+                if last_update_inst.elapsed() > Duration::from_millis(20) {
                     window.request_redraw();
                     last_update_inst = Instant::now();
                 }
@@ -551,13 +512,7 @@ fn main() {
                 log::info!("Resizing to {:?}", size);
                 swapchain_desc.width = if size.width == 0 {1} else { size.width };
                 swapchain_desc.height = if size.height == 0 {1} else { size.height };
-                resize(
-                    &swapchain_desc,
-                    &h.device,
-                    &h.queue,
-                    &uniform_buf,
-                    camera_state, 
-                );
+                resize(&swapchain_desc, &h.device, &h.queue, &uniform_buf);
                 swapchain = h.device.create_swap_chain(&h.surface, &swapchain_desc);
             }
             Event::WindowEvent {ref event, .. } => match event {
@@ -594,8 +549,6 @@ fn main() {
                     }
                 };
 
-                update_camera(&swapchain_desc, &h.queue, &uniform_buf, camera_state);
-
                 // Render Scene
                 render(
                     &frame.output,
@@ -606,7 +559,6 @@ fn main() {
                     &vertex_buf,
                     &index_buf,
                     index_data.len(),
-                    push_constant(zoom, offset),
                     &spawner);
 
                 // Render UI
@@ -632,23 +584,6 @@ fn main() {
                             if ui.button(im_str!("Toggle Demo"), [100., 20.]) {
                                 show_demo = !show_demo
                             }
-                            ui.separator();
-
-                            imgui::Slider::new(im_str!("Camera Rotation"))
-                                .range(0.0..=6.0)
-                                .build(&ui, &mut camera_state);
-                            ui.separator();
-                            imgui::Slider::new(im_str!("Texture Zoom"))
-                                .range(0.001..=1.0)
-                                .build(&ui, &mut zoom);
-                            ui.separator();
-                            imgui::Slider::new(im_str!("Texture X offset"))
-                                .range(0.00..=1.0)
-                                .build(&ui, &mut offset[0]);
-                            ui.separator();
-                            imgui::Slider::new(im_str!("Texture Y offset"))
-                                .range(0.00..=1.0)
-                                .build(&ui, &mut offset[1]);
                             ui.separator();
                         });
                     if show_demo {
