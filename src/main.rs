@@ -17,7 +17,6 @@ struct Handle {
     queue: wgpu::Queue,
 }
 
-
 #[cfg_attr(rustfmt, rustfmt_skip)]
 #[allow(unused)]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
@@ -33,6 +32,7 @@ struct Vertex {
     _pos: [f32; 4],
     _tex_coord:[f32; 2],
 }
+
 fn vertex(pos: [i8; 3], tc:[i8; 2]) -> Vertex {
     Vertex {
         _pos: [pos[0] as f32, pos[1] as f32, pos[2] as f32, 1.0],
@@ -54,6 +54,30 @@ fn push_constant(zoom: f32, offset: [f32; 2]) -> PushConstant {
         _zoom: zoom,
         _offset: offset,
         _pad: 0.0
+    }
+}
+
+
+struct BufferDimensions {
+    width: usize,
+    height: usize,
+    unpadded_bytes_per_row: usize,
+    padded_bytes_per_row: usize,
+}
+
+impl BufferDimensions {
+    fn new(width: usize, height: usize) -> Self {
+        let bytes_per_pixel = std::mem::size_of::<u32>();
+        let unpadded_bytes_per_row = width * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+        let padded_bytes_per_row_padding = (align - unpadded_bytes_per_row % align) % align;
+        let padded_bytes_per_row = unpadded_bytes_per_row + padded_bytes_per_row_padding;
+        Self {
+            width,
+            height,
+            unpadded_bytes_per_row,
+            padded_bytes_per_row,
+        }
     }
 }
 
@@ -320,7 +344,41 @@ fn main() {
     let mut msaa_view = 
         create_msaa_target(&swapchain_desc, &h.device, msaa_samples);
 
-    log::info!("Initializing Rendering Pipeline");
+    log::info!("Initializing screen capture target");
+    // It is a webgpu requirement that BufferCopyView.layout.bytes_per_row 
+    // % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT == 0
+    // So we calculate padded_bytes_per_row by rounding unpadded_bytes_per_row
+    // up to the next multiple of wgpu::COPY_BYTES_PER_ROW_ALIGNMENT.
+    // https://en.wikipedia.org/wiki/Data_structure_alignment#Computing_padding
+    let capture_buffer_dimensions = 
+        BufferDimensions::new(swapchain_desc.width as usize, swapchain_desc.height as usize);
+    // The output buffer lets us retrieve the data as an array
+    let capture_buffer = h.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (capture_buffer_dimensions.padded_bytes_per_row * capture_buffer_dimensions.height) as u64,
+        usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let capture_texture_extent = wgpu::Extent3d {
+        width: capture_buffer_dimensions.width as u32,
+        height: capture_buffer_dimensions.height as u32,
+        depth: 1,
+    };
+    let capture_texture_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+    // The render pipeline renders data into this texture
+    let capture_texture = h.device.create_texture(&wgpu::TextureDescriptor {
+        size: capture_texture_extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: capture_texture_format,
+        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
+        label: None,
+    });
+
+    log::info!("Initializing Rendering Pipelines");
     let bind_group_layout = h.device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -393,8 +451,8 @@ fn main() {
     let scene_frag_shader = h.device
         .create_shader_module(wgpu::include_spirv!("../shaders/scene.frag.spv"));
 
-    let pipeline = h.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None,
+    let scene_pipeline = h.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Scene Pipeline"),
         layout: Some(&pipeline_layout),
         vertex_stage: wgpu::ProgrammableStageDescriptor {
             module: &scene_vert_shader,
@@ -424,6 +482,35 @@ fn main() {
     });
 
 
+    let capture_pipeline = h.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Capture pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex_stage: wgpu::ProgrammableStageDescriptor {
+            module: &capture_vert_shader,
+            entry_point: "main",
+        },
+        fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
+            module: &capture_frag_shader,
+            entry_point: "main",
+        }),
+        rasterization_state: Some(wgpu::RasterizationStateDescriptor {
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode:wgpu::CullMode::Back,
+            ..Default::default()
+        }),
+        primitive_topology: wgpu::PrimitiveTopology::TriangleList,
+        color_states: &[wgpu::ColorStateDescriptor {
+            format: capture_texture_format,
+            color_blend: wgpu::BlendDescriptor::REPLACE,
+            alpha_blend: wgpu::BlendDescriptor::REPLACE,
+            write_mask: wgpu::ColorWrite::ALL,
+        }],
+        depth_stencil_state: None,
+        vertex_state: vertex_state.clone(),
+        sample_count: 1,
+        sample_mask: !0,
+        alpha_to_coverage_enabled: false,
+    });
     log::info!("Initializing buffers & textures...");
     
     let (vertex_data, index_data) = create_test_mesh();
@@ -639,7 +726,7 @@ let frame = match swapchain.get_current_frame() { Ok(frame) => frame,
                     &frame.output,
                     &h.device,
                     &h.queue,
-                    &pipeline,
+                    &scene_pipeline,
                     &bind_group,
                     &vertex_buf,
                     &index_buf,
