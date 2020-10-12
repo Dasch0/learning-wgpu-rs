@@ -9,10 +9,10 @@ use bytemuck::{Pod, Zeroable};
 use imgui::*;
 
 struct Handle {
-    instance: wgpu::Instance,
+    _instance: wgpu::Instance,
     size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface,
-    adapter: wgpu::Adapter,
+    _adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
 }
@@ -137,17 +137,17 @@ fn create_test_camera(aspect_ratio: f32, pos: f32) -> cgmath::Matrix4<f32> {
 
 async fn setup (window: &Window) -> Handle {
     log::info!("Initializing instance...");
-    let instance = wgpu::Instance::new(wgpu::BackendBit::PRIMARY);
+    let _instance = wgpu::Instance::new(wgpu::BackendBit::PRIMARY);
     
     log::info!("Obtaining window surface...");
     let (size, surface) = unsafe {
         let size = window.inner_size();
-        let surface = instance.create_surface(window);
+        let surface = _instance.create_surface(window);
         (size, surface)
     };
 
     log::info!("Initializing adapter...");
-    let adapter = instance
+    let _adapter = _instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::Default,
             compatible_surface: Some(&surface),
@@ -159,7 +159,7 @@ async fn setup (window: &Window) -> Handle {
     let required_features = 
         wgpu::Features::default() | wgpu::Features::PUSH_CONSTANTS;
 
-    let adapter_features = adapter.features();
+    let adapter_features = _adapter.features();
 
     let required_limits = wgpu::Limits {
         max_push_constant_size: 16,
@@ -169,7 +169,7 @@ async fn setup (window: &Window) -> Handle {
     let trace_dir = std::env::var("WGPU_TRACE");
     
     log::info!("Initializing device & queue...");
-    let(device, queue) = adapter
+    let(device, queue) = _adapter
         .request_device(
             &wgpu::DeviceDescriptor {
                 features: (adapter_features & optional_features) | required_features,
@@ -183,10 +183,10 @@ async fn setup (window: &Window) -> Handle {
     log::info!("Setup complete!");
 
     Handle {
-        instance,
+        _instance,
         size,
         surface,
-        adapter,
+        _adapter,
         device,
         queue,
     }
@@ -206,17 +206,45 @@ fn update_camera(
     queue.write_buffer(&camera_buf, 0, bytemuck::cast_slice(camera_ref));
 }
 
+fn create_msaa_target(swapchain_desc: &wgpu::SwapChainDescriptor,
+                      device: &wgpu::Device,
+                      msaa_samples: u32,
+) -> wgpu::TextureView {
+    let multisampled_texture_extent = wgpu::Extent3d {
+        width: swapchain_desc.width,
+        height: swapchain_desc.height,
+        depth: 1,
+    };
+    let multisampled_frame_descriptor = &wgpu::TextureDescriptor {
+        size: multisampled_texture_extent,
+        mip_level_count: 1,
+        sample_count: msaa_samples,
+        dimension: wgpu::TextureDimension::D2,
+        format: swapchain_desc.format,
+        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT,
+        label: None,
+    };
+    
+    device
+        .create_texture(multisampled_frame_descriptor)
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 fn resize(
     swapchain_desc: &wgpu::SwapChainDescriptor,
-    _device: &wgpu::Device,
+    device: &wgpu::Device,
     queue: &wgpu::Queue,
     camera_buf: &wgpu::Buffer,
     camera_state: f32,
-) {
+    msaa_view: &mut wgpu::TextureView,
+    msaa_samples: u32,
+){
     update_camera(swapchain_desc, queue, camera_buf, camera_state);
+    *msaa_view = create_msaa_target(swapchain_desc, device, msaa_samples);
 }
 
 fn render<T:Pod>(
+    multisampled_framebuffer: &wgpu::TextureView,
     frame: &wgpu::SwapChainTexture,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -229,12 +257,14 @@ fn render<T:Pod>(
     _spawner: &impl futures::task::LocalSpawn,
 ) {
     let mut encoder = device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None});
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: None,
+        });
 
     let mut renderpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         color_attachments: &[wgpu::RenderPassColorAttachmentDescriptor {
-            attachment: &frame.view,
-            resolve_target: None,
+            attachment: &multisampled_framebuffer,
+            resolve_target: Some(&frame.view),
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color {
                     r: 0.1,
@@ -271,6 +301,9 @@ fn main() {
     // Init GPU Handle
     let h = futures::executor::block_on(setup(&window));
 
+    // define sample count for MSAA
+    let msaa_samples = 8;
+
     log::info!("Initializing swapchain...");
     let mut swapchain_desc = wgpu::SwapChainDescriptor {
         usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT,
@@ -283,7 +316,11 @@ fn main() {
         .device
         .create_swap_chain(&h.surface, &swapchain_desc);
 
-   log::info!("Initializing Rendering Pipeline");
+    log::info!("Initializing MSAA target...");
+    let mut msaa_view = 
+        create_msaa_target(&swapchain_desc, &h.device, msaa_samples);
+
+    log::info!("Initializing Rendering Pipeline");
     let bind_group_layout = h.device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -381,7 +418,7 @@ fn main() {
         }],
         depth_stencil_state: None,
         vertex_state: vertex_state.clone(),
-        sample_count: 1,
+        sample_count: msaa_samples,
         sample_mask: !0,
         alpha_to_coverage_enabled: false,
     });
@@ -403,7 +440,7 @@ fn main() {
         usage: wgpu::BufferUsage::INDEX,
     });
 
-    let size = 8192u32;
+    let size = 1048u32;
     let texels = create_mandelbrot_texture(size as usize);
     let texture_extent = wgpu::Extent3d {
         width: size,
@@ -477,7 +514,7 @@ fn main() {
     });
 
     log::info!("Initializing imgui...");
-    let mut hidpi_factor = window.scale_factor();
+    let hidpi_factor = window.scale_factor();
     let mut imgui = imgui::Context::create();
     let mut platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
     platform.attach_window(
@@ -509,7 +546,7 @@ fn main() {
 
     // UI States
     let mut last_frame = std::time::Instant::now();
-    let mut show_demo = true;
+    let mut show_demo = false;
     let mut last_cursor = None;
     let mut camera_state: f32 = 0.0;
     let mut zoom: f32 = 0.1;
@@ -556,7 +593,9 @@ fn main() {
                     &h.device,
                     &h.queue,
                     &uniform_buf,
-                    camera_state, 
+                    camera_state,
+                    &mut msaa_view,
+                    msaa_samples,
                 );
                 swapchain = h.device.create_swap_chain(&h.surface, &swapchain_desc);
             }
@@ -580,9 +619,7 @@ fn main() {
                 let now = Instant::now();
                 imgui.io_mut().update_delta_time(now - last_frame);
                 last_frame = now;
-
-                let frame = match swapchain.get_current_frame() {
-                    Ok(frame) => frame,
+let frame = match swapchain.get_current_frame() { Ok(frame) => frame,
                     Err(e) => {
                         log::warn!("dropped frame: {:?}", e);
                         swapchain = h
@@ -598,6 +635,7 @@ fn main() {
 
                 // Render Scene
                 render(
+                    &msaa_view,
                     &frame.output,
                     &h.device,
                     &h.queue,
