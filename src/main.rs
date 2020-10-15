@@ -180,8 +180,14 @@ async fn setup (window: &Window) -> Handle {
        .unwrap();
 
     let optional_features = wgpu::Features::empty();
+    
+    // TODO: support for setups without unsized_binding_array
     let required_features = 
-        wgpu::Features::default() | wgpu::Features::PUSH_CONSTANTS;
+        wgpu::Features::default() 
+        | wgpu::Features::PUSH_CONSTANTS
+        | wgpu::Features::UNSIZED_BINDING_ARRAY
+        | wgpu::Features::SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
+        | wgpu::Features::SAMPLED_TEXTURE_BINDING_ARRAY;
 
     let adapter_features = _adapter.features();
 
@@ -350,36 +356,64 @@ fn main() {
     // So we calculate padded_bytes_per_row by rounding unpadded_bytes_per_row
     // up to the next multiple of wgpu::COPY_BYTES_PER_ROW_ALIGNMENT.
     // https://en.wikipedia.org/wiki/Data_structure_alignment#Computing_padding
-    let capture_buffer_dimensions = 
-        BufferDimensions::new(swapchain_desc.width as usize, swapchain_desc.height as usize);
+    let capture_buffer_dimensions = BufferDimensions::new(
+        swapchain_desc.width as usize,
+        swapchain_desc.height as usize
+    );
     // The output buffer lets us retrieve the data as an array
     let capture_buffer = h.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: (capture_buffer_dimensions.padded_bytes_per_row * capture_buffer_dimensions.height) as u64,
+        size: (capture_buffer_dimensions.padded_bytes_per_row 
+               * capture_buffer_dimensions.height) as u64,
         usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
         mapped_at_creation: false,
     });
-
     let capture_texture_extent = wgpu::Extent3d {
         width: capture_buffer_dimensions.width as u32,
         height: capture_buffer_dimensions.height as u32,
         depth: 1,
     };
-    let capture_texture_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    
+    let capture_format= wgpu::TextureFormat::Rgba8UnormSrgb;
 
-    // The render pipeline renders data into this texture
-    let capture_texture = h.device.create_texture(&wgpu::TextureDescriptor {
-        size: capture_texture_extent,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: capture_texture_format,
-        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
-        label: None,
-    });
+    // Create 10 multisampled textures for capture
+    let capture_count = 10;
+    let capture_msaa_texture :Vec<wgpu::Texture> = (1..capture_count).map(|_| {
+        h.device.create_texture(&wgpu::TextureDescriptor {
+            size: capture_texture_extent,
+            mip_level_count: 1,
+            sample_count: msaa_samples,
+            dimension: wgpu::TextureDimension::D2,
+            format: capture_format,
+            usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
+            label: None,
+        })
+    }).collect();
+
+    // Create 10 resolve targets for capture
+    let capture_resolve_texture : Vec<wgpu::Texture> = (1..capture_count).map(|_| {
+        h.device.create_texture(&wgpu::TextureDescriptor {
+            size: capture_texture_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: capture_format,
+            usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
+            label: None,
+        })
+    }).collect();
+
+    // Create views for capture msaa and resolve views
+    let capture_msaa_view : Vec<wgpu::TextureView> = (1..capture_count).map(|i| {
+        capture_msaa_texture[i].create_view(&wgpu::TextureViewDescriptor::default())
+    }).collect();
+
+    let capture_resolve_view : Vec<wgpu::TextureView> = (1..capture_count).map(|i| {
+        capture_resolve_texture[i].create_view(&wgpu::TextureViewDescriptor::default())
+    }).collect();
 
     log::info!("Initializing Rendering Pipelines");
-    let bind_group_layout = h.device
+    let scene_bind_group_layout = h.device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -411,19 +445,65 @@ fn main() {
                     count: None,
                 },
             ],
-        }
-    );
+        })
+    ;
 
-    let pipeline_layout = h.device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+    let capture_bind_group_layout = h.device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&bind_group_layout],
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStage::VERTEX,
+                    ty: wgpu::BindingType::UniformBuffer {
+                        dynamic: false,
+                        min_binding_size: wgpu::BufferSize::new(64),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStage::FRAGMENT,
+                    ty: wgpu::BindingType::SampledTexture {
+                        multisampled: false,
+                        component_type: wgpu::TextureComponentType::Float,
+                        dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: std::num::NonZeroU32::new(capture_count as u32),
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStage::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler {
+                        comparison: false,
+                    },
+                    count: None,
+                },
+            ],
+        })
+    ;
+
+    let scene_pipeline_layout = h.device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Scene pipeline layout"),
+            bind_group_layouts: &[&scene_bind_group_layout],
             push_constant_ranges: &[wgpu::PushConstantRange {
                 stages: wgpu::ShaderStage::FRAGMENT,
                 range: (0..16),
             }],
-        }
-    );
+        })
+    ;
+    
+    let capture_pipeline_layout = h.device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Capture pipeline layout"),
+            bind_group_layouts: &[&capture_bind_group_layout],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStage::FRAGMENT,
+                range: (0..16),
+            }],
+        })
+    ;
 
     let vertex_size = std::mem::size_of::<Vertex>();
     let vertex_state = wgpu::VertexStateDescriptor {
@@ -450,69 +530,76 @@ fn main() {
         .create_shader_module(wgpu::include_spirv!("../shaders/scene.vert.spv"));
     let scene_frag_shader = h.device
         .create_shader_module(wgpu::include_spirv!("../shaders/scene.frag.spv"));
+    let capture_vert_shader = h.device
+        .create_shader_module(wgpu::include_spirv!("../shaders/capture.vert.spv"));
+    let capture_frag_shader = h.device
+        .create_shader_module(wgpu::include_spirv!("../shaders/capture.frag.spv"));
 
-    let scene_pipeline = h.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Scene Pipeline"),
-        layout: Some(&pipeline_layout),
-        vertex_stage: wgpu::ProgrammableStageDescriptor {
-            module: &scene_vert_shader,
-            entry_point: "main",
-        },
-        fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
-            module: &scene_frag_shader,
-            entry_point: "main",
-        }),
-        rasterization_state: Some(wgpu::RasterizationStateDescriptor {
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode:wgpu::CullMode::Back,
-            ..Default::default()
-        }),
-        primitive_topology: wgpu::PrimitiveTopology::TriangleList,
-        color_states: &[wgpu::ColorStateDescriptor {
-            format: swapchain_desc.format,
-            color_blend: wgpu::BlendDescriptor::REPLACE,
-            alpha_blend: wgpu::BlendDescriptor::REPLACE,
-            write_mask: wgpu::ColorWrite::ALL,
-        }],
-        depth_stencil_state: None,
-        vertex_state: vertex_state.clone(),
-        sample_count: msaa_samples,
-        sample_mask: !0,
-        alpha_to_coverage_enabled: false,
-    });
+    let scene_pipeline = h.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Scene Pipeline"),
+            layout: Some(&scene_pipeline_layout),
+            vertex_stage: wgpu::ProgrammableStageDescriptor {
+                module: &scene_vert_shader,
+                entry_point: "main",
+            },
+            fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
+                module: &scene_frag_shader,
+                entry_point: "main",
+            }),
+            rasterization_state: Some(wgpu::RasterizationStateDescriptor {
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode:wgpu::CullMode::Back,
+                ..Default::default()
+            }),
+            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
+            color_states: &[wgpu::ColorStateDescriptor {
+                format: swapchain_desc.format,
+                color_blend: wgpu::BlendDescriptor::REPLACE,
+                alpha_blend: wgpu::BlendDescriptor::REPLACE,
+                write_mask: wgpu::ColorWrite::ALL,
+            }],
+            depth_stencil_state: None,
+            vertex_state: vertex_state.clone(),
+            sample_count: msaa_samples,
+            sample_mask: !0,
+            alpha_to_coverage_enabled: false,
+        })
+    ;
 
+    let capture_pipeline = h.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Capture pipeline"),
+            layout: Some(&scene_pipeline_layout),
+            vertex_stage: wgpu::ProgrammableStageDescriptor {
+                module: &capture_vert_shader,
+                entry_point: "main",
+            },
+            fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
+                module: &capture_frag_shader,
+                entry_point: "main",
+            }),
+            rasterization_state: Some(wgpu::RasterizationStateDescriptor {
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode:wgpu::CullMode::Back,
+                ..Default::default()
+            }),
+            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
+            color_states: &[wgpu::ColorStateDescriptor {
+                format: capture_format,
+                color_blend: wgpu::BlendDescriptor::REPLACE,
+                alpha_blend: wgpu::BlendDescriptor::REPLACE,
+                write_mask: wgpu::ColorWrite::ALL,
+            }],
+            depth_stencil_state: None,
+            vertex_state: vertex_state.clone(),
+            sample_count: msaa_samples,
+            sample_mask: !0,
+            alpha_to_coverage_enabled: false,
+        }
+    );
 
-    let capture_pipeline = h.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Capture pipeline"),
-        layout: Some(&pipeline_layout),
-        vertex_stage: wgpu::ProgrammableStageDescriptor {
-            module: &capture_vert_shader,
-            entry_point: "main",
-        },
-        fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
-            module: &capture_frag_shader,
-            entry_point: "main",
-        }),
-        rasterization_state: Some(wgpu::RasterizationStateDescriptor {
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode:wgpu::CullMode::Back,
-            ..Default::default()
-        }),
-        primitive_topology: wgpu::PrimitiveTopology::TriangleList,
-        color_states: &[wgpu::ColorStateDescriptor {
-            format: capture_texture_format,
-            color_blend: wgpu::BlendDescriptor::REPLACE,
-            alpha_blend: wgpu::BlendDescriptor::REPLACE,
-            write_mask: wgpu::ColorWrite::ALL,
-        }],
-        depth_stencil_state: None,
-        vertex_state: vertex_state.clone(),
-        sample_count: 1,
-        sample_mask: !0,
-        alpha_to_coverage_enabled: false,
-    });
     log::info!("Initializing buffers & textures...");
-    
     let (vertex_data, index_data) = create_test_mesh();
 
     let vertex_buf = h.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -570,23 +657,41 @@ fn main() {
         ..Default::default()
     });
 
-    let camera = create_test_camera(
+    log::info!("Creating Cameras...");
+    let scene_camera = create_test_camera(
         swapchain_desc.width as f32 / swapchain_desc.height as f32,
         0.0,
     );
-    let camera_ref: &[f32; 16] = camera.as_ref();
-    let uniform_buf: wgpu::Buffer = h.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Uniform Buffer"),
-        contents: bytemuck::cast_slice(camera_ref),
-        usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
-    });
+    let scene_camera_ref: &[f32; 16] = scene_camera.as_ref();
+    let scene_camera_buf: wgpu::Buffer = h.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Uniform Buffer"),
+            contents: bytemuck::cast_slice(scene_camera_ref),
+            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+        }
+    );
 
-    let bind_group = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        layout: &bind_group_layout,
+    let capture_camera : Vec<cgmath::Matrix4<f32>> = (1..capture_count).map(|x| {
+        create_test_camera(
+            swapchain_desc.width as f32 / swapchain_desc.height as f32,
+            x as f32)
+    }).collect();
+    let capture_camera_ref : Vec<&[f32; 16]> = (1..capture_count).map(|i| {
+        capture_camera[i].as_ref()
+    }).collect();
+    let capture_camera_buf = h.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(capture_camera_ref[i]),
+            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+        });
+    log::info!("Creating bind groups...");
+    let scene_bind_group = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &scene_bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::Buffer(uniform_buf.slice(..)), 
+                resource: wgpu::BindingResource::Buffer(scene_camera_buf.slice(..)), 
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -597,7 +702,26 @@ fn main() {
                 resource: wgpu::BindingResource::Sampler(&sampler),
             },
         ],
-        label: None,
+        label: Some("Scene Bind Group"),
+    });
+
+    let capture_bind_group = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &capture_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(capture_camera_buf.slice(..)),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureViewArray(&capture_msaa_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+        label: Some("Capture Bind Group"),
     });
 
     log::info!("Initializing imgui...");
@@ -652,7 +776,7 @@ fn main() {
         let _ = (
             &h,
             &swapchain_desc,
-            &uniform_buf,
+            &scene_camera_buf,
         );
         
         // Set control flow to wait min(next event, 10ms) 
@@ -679,7 +803,7 @@ fn main() {
                     &swapchain_desc,
                     &h.device,
                     &h.queue,
-                    &uniform_buf,
+                    &scene_camera_buf,
                     camera_state,
                     &mut msaa_view,
                     msaa_samples,
@@ -706,7 +830,7 @@ fn main() {
                 let now = Instant::now();
                 imgui.io_mut().update_delta_time(now - last_frame);
                 last_frame = now;
-let frame = match swapchain.get_current_frame() { Ok(frame) => frame,
+                let frame = match swapchain.get_current_frame() { Ok(frame) => frame,
                     Err(e) => {
                         log::warn!("dropped frame: {:?}", e);
                         swapchain = h
@@ -718,7 +842,7 @@ let frame = match swapchain.get_current_frame() { Ok(frame) => frame,
                     }
                 };
 
-                update_camera(&swapchain_desc, &h.queue, &uniform_buf, camera_state);
+                update_camera(&swapchain_desc, &h.queue, &scene_camera_buf, camera_state);
 
                 // Render Scene
                 render(
@@ -727,7 +851,7 @@ let frame = match swapchain.get_current_frame() { Ok(frame) => frame,
                     &h.device,
                     &h.queue,
                     &scene_pipeline,
-                    &bind_group,
+                    &scene_bind_group,
                     &vertex_buf,
                     &index_buf,
                     index_data.len(),
@@ -819,3 +943,4 @@ let frame = match swapchain.get_current_frame() { Ok(frame) => frame,
         platform.handle_event(imgui.io_mut(), &window, &event)
     });
 }
+
