@@ -185,8 +185,8 @@ async fn setup (window: &Window) -> Handle {
     let required_features = 
         wgpu::Features::default() 
         | wgpu::Features::PUSH_CONSTANTS
-        | wgpu::Features::UNSIZED_BINDING_ARRAY
-        | wgpu::Features::SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
+        //| wgpu::Features::UNSIZED_BINDING_ARRAY
+        //| wgpu::Features::SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
         | wgpu::Features::SAMPLED_TEXTURE_BINDING_ARRAY;
 
     let adapter_features = _adapter.features();
@@ -274,8 +274,8 @@ fn resize(
 }
 
 fn render<T:Pod>(
-    multisampled_framebuffer: &wgpu::TextureView,
-    frame: &wgpu::SwapChainTexture,
+    msaa_target: &wgpu::TextureView,
+    resolve_target: &wgpu::TextureView,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pipeline: &wgpu::RenderPipeline,
@@ -293,8 +293,8 @@ fn render<T:Pod>(
 
     let mut renderpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         color_attachments: &[wgpu::RenderPassColorAttachmentDescriptor {
-            attachment: &multisampled_framebuffer,
-            resolve_target: Some(&frame.view),
+            attachment: &msaa_target,
+            resolve_target: Some(resolve_target),
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color {
                     r: 0.1,
@@ -378,7 +378,7 @@ fn main() {
 
     // Create 10 multisampled textures for capture
     let capture_count = 10;
-    let capture_msaa_texture :Vec<wgpu::Texture> = (1..capture_count).map(|_| {
+    let capture_msaa_texture :Vec<wgpu::Texture> = (0..capture_count).map(|_| {
         h.device.create_texture(&wgpu::TextureDescriptor {
             size: capture_texture_extent,
             mip_level_count: 1,
@@ -391,28 +391,29 @@ fn main() {
     }).collect();
 
     // Create 10 resolve targets for capture
-    let capture_resolve_texture : Vec<wgpu::Texture> = (1..capture_count).map(|_| {
+    let mut capture_resolve_texture : Vec<wgpu::Texture> = (0..capture_count).map(|_| {
         h.device.create_texture(&wgpu::TextureDescriptor {
             size: capture_texture_extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: capture_format,
-            usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
+            usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT 
+                | wgpu::TextureUsage::COPY_SRC
+                | wgpu::TextureUsage::SAMPLED,
             label: None,
         })
     }).collect();
 
     // Create views for capture msaa and resolve views
-    let capture_msaa_view : Vec<wgpu::TextureView> = (1..capture_count).map(|i| {
+    let capture_msaa_view : Vec<wgpu::TextureView> = (0..capture_count).map(|i| {
         capture_msaa_texture[i].create_view(&wgpu::TextureViewDescriptor::default())
     }).collect();
 
-    let capture_resolve_view : Vec<wgpu::TextureView> = (1..capture_count).map(|i| {
-        capture_resolve_texture[i].create_view(&wgpu::TextureViewDescriptor::default())
-    }).collect();
-
-    log::info!("Initializing Rendering Pipelines");
+    let capture_resolve_view = capture_resolve_texture[2]
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    
+    log::info!("Initializing Rendering Pipelines...");
     let scene_bind_group_layout = h.device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -457,7 +458,10 @@ fn main() {
                     visibility: wgpu::ShaderStage::VERTEX,
                     ty: wgpu::BindingType::UniformBuffer {
                         dynamic: false,
-                        min_binding_size: wgpu::BufferSize::new(64),
+                        min_binding_size: wgpu::BufferSize::new(
+                            (std::mem::size_of::<cgmath::Matrix4::<f32>>() 
+                             * capture_count) as u64
+                        ),
                     },
                     count: None,
                 },
@@ -469,7 +473,7 @@ fn main() {
                         component_type: wgpu::TextureComponentType::Float,
                         dimension: wgpu::TextureViewDimension::D2,
                     },
-                    count: std::num::NonZeroU32::new(capture_count as u32),
+                    count: None, 
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
@@ -570,7 +574,7 @@ fn main() {
     let capture_pipeline = h.device
         .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Capture pipeline"),
-            layout: Some(&scene_pipeline_layout),
+            layout: Some(&capture_pipeline_layout),
             vertex_stage: wgpu::ProgrammableStageDescriptor {
                 module: &capture_vert_shader,
                 entry_point: "main",
@@ -671,20 +675,19 @@ fn main() {
         }
     );
 
-    let capture_camera : Vec<cgmath::Matrix4<f32>> = (1..capture_count).map(|x| {
+    // store as vector of primatives so that bytemuck works
+    let capture_camera : Vec<[[f32; 4]; 4]> = (0..capture_count).map(|x| {
         create_test_camera(
             swapchain_desc.width as f32 / swapchain_desc.height as f32,
-            x as f32)
-    }).collect();
-    let capture_camera_ref : Vec<&[f32; 16]> = (1..capture_count).map(|i| {
-        capture_camera[i].as_ref()
-    }).collect();
+            x as f32).into()
+    }).collect();    
     let capture_camera_buf = h.device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(capture_camera_ref[i]),
+            contents: bytemuck::cast_slice(&capture_camera),
             usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
         });
+
     log::info!("Creating bind groups...");
     let scene_bind_group = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
         layout: &scene_bind_group_layout,
@@ -714,7 +717,7 @@ fn main() {
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureViewArray(&capture_msaa_view),
+                resource: wgpu::BindingResource::TextureView(&texture_view),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -748,12 +751,64 @@ fn main() {
             }),
         }]);
 
+    let imgui_render_config = imgui_wgpu::RendererConfig::new()
+        .set_texture_format(swapchain_desc.format);
+
     let mut imgui_renderer = imgui_wgpu::Renderer::new(
         &mut imgui,
         &h.device,
         &h.queue,
-        swapchain_desc.format,
+        imgui_render_config,
     );
+
+    // Create imgui texture for drawing rendered textures in UI
+
+    let imgui_texture_bind_group_layout = h.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None, 
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStage::FRAGMENT,
+                ty: wgpu::BindingType::SampledTexture {
+                    multisampled: false,
+                    component_type: wgpu::TextureComponentType::Float,
+                    dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStage::FRAGMENT,
+                ty: wgpu::BindingType::Sampler { comparison: false },
+                count: None,
+            },
+        ],
+    });
+    let imgui_texture_bind_group = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &imgui_texture_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&capture_resolve_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+
+    let imgui_texture_view = capture_resolve_texture[2]
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let imgui_texture = imgui_wgpu::Texture::from_raw_parts(
+        capture_resolve_texture.remove(2),
+        imgui_texture_view,
+        imgui_texture_bind_group,
+        capture_texture_extent
+    );
+
+    let imgui_texture_id = imgui_renderer.textures.insert(imgui_texture);
 
     // UI States
     let mut last_frame = std::time::Instant::now();
@@ -847,7 +902,7 @@ fn main() {
                 // Render Scene
                 render(
                     &msaa_view,
-                    &frame.output,
+                    &frame.output.view,
                     &h.device,
                     &h.queue,
                     &scene_pipeline,
@@ -856,7 +911,22 @@ fn main() {
                     &index_buf,
                     index_data.len(),
                     push_constant(zoom, offset),
-                    &spawner);
+                    &spawner
+                );
+
+                render(
+                    &capture_msaa_view[2],
+                    &capture_resolve_view,
+                    &h.device,
+                    &h.queue,
+                    &capture_pipeline,
+                    &capture_bind_group,
+                    &vertex_buf,
+                    &index_buf,
+                    index_data.len(),
+                    push_constant(zoom, offset),
+                    &spawner
+                );
 
                 // Render UI
                 platform
@@ -898,6 +968,8 @@ fn main() {
                             imgui::Slider::new(im_str!("Texture Y offset"))
                                 .range(0.00..=1.0)
                                 .build(&ui, &mut offset[1]);
+                            ui.separator();
+                            imgui::Image::new(imgui_texture_id, [500.0, 500.0]).build(&ui);
                             ui.separator();
                         });
                     if show_demo {
