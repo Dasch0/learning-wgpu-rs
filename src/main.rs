@@ -8,13 +8,23 @@ use std::time::{Instant, Duration};
 use bytemuck::{Pod, Zeroable};
 use imgui::*;
 
-struct Handle {
+pub struct Handle {
     _instance: wgpu::Instance,
     size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface,
     _adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+}
+
+pub struct UiState {
+    last_frame: std::time::Instant,
+    show_demo: bool,
+    last_cursor: Option<imgui::MouseCursor>,
+    camera_state: f32,
+    zoom: f32,
+    offset: [f32; 2],
+    texture_id: imgui::TextureId,
 }
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
@@ -57,11 +67,10 @@ fn push_constant(zoom: f32, offset: [f32; 2]) -> PushConstant {
     }
 }
 
-
 struct BufferDimensions {
     width: usize,
     height: usize,
-    unpadded_bytes_per_row: usize,
+    _unpadded_bytes_per_row: usize,
     padded_bytes_per_row: usize,
 }
 
@@ -75,7 +84,7 @@ impl BufferDimensions {
         Self {
             width,
             height,
-            unpadded_bytes_per_row,
+            _unpadded_bytes_per_row: unpadded_bytes_per_row,
             padded_bytes_per_row,
         }
     }
@@ -159,7 +168,7 @@ fn create_test_camera(aspect_ratio: f32, pos: f32) -> cgmath::Matrix4<f32> {
     correction * proj * view
 }
 
-async fn setup (window: &Window) -> Handle {
+async fn init_gpu (window: &Window) -> Handle {
     log::info!("Initializing instance...");
     let _instance = wgpu::Instance::new(wgpu::BackendBit::PRIMARY);
     
@@ -220,6 +229,335 @@ async fn setup (window: &Window) -> Handle {
         device,
         queue,
     }
+}
+
+fn init_scene_config(
+    device: &wgpu::Device,
+    texture_format: wgpu::TextureFormat,
+    msaa_samples: u32
+) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout, wgpu::RenderPipeline) {
+    
+    log::info!("Initializing Rendering Pipelines...");
+    let scene_bind_group_layout = device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStage::VERTEX,
+                    ty: wgpu::BindingType::UniformBuffer {
+                        dynamic: false,
+                        min_binding_size: wgpu::BufferSize::new(64),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStage::FRAGMENT,
+                    ty: wgpu::BindingType::SampledTexture {
+                        multisampled: false,
+                        component_type: wgpu::TextureComponentType::Float,
+                        dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStage::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler {
+                        comparison: false,
+                    },
+                    count: None,
+                },
+            ],
+        })
+    ;
+
+    let scene_pipeline_layout = device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Scene pipeline layout"),
+            bind_group_layouts: &[&scene_bind_group_layout],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStage::FRAGMENT,
+                range: (0..16),
+            }],
+        })
+    ;
+    
+    let vertex_size = std::mem::size_of::<Vertex>();
+    let vertex_state = wgpu::VertexStateDescriptor {
+        index_format: wgpu::IndexFormat::Uint16,
+        vertex_buffers: &[wgpu::VertexBufferDescriptor {
+            stride: vertex_size as wgpu::BufferAddress,
+            step_mode: wgpu::InputStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttributeDescriptor {
+                    format: wgpu::VertexFormat::Float4,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttributeDescriptor {
+                    format: wgpu::VertexFormat::Float2,
+                    offset: 4 * 4, // TODO: cleanup
+                    shader_location: 1,
+                },
+            ],
+        }],
+    };
+
+    let scene_vert_shader = device
+        .create_shader_module(wgpu::include_spirv!("../shaders/scene.vert.spv"));
+    let scene_frag_shader = device
+        .create_shader_module(wgpu::include_spirv!("../shaders/scene.frag.spv"));
+
+    let scene_pipeline = device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Scene Pipeline"),
+            layout: Some(&scene_pipeline_layout),
+            vertex_stage: wgpu::ProgrammableStageDescriptor {
+                module: &scene_vert_shader,
+                entry_point: "main",
+            },
+            fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
+                module: &scene_frag_shader,
+                entry_point: "main",
+            }),
+            rasterization_state: Some(wgpu::RasterizationStateDescriptor {
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode:wgpu::CullMode::Back,
+                ..Default::default()
+            }),
+            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
+            color_states: &[wgpu::ColorStateDescriptor {
+                format: texture_format,
+                color_blend: wgpu::BlendDescriptor::REPLACE,
+                alpha_blend: wgpu::BlendDescriptor::REPLACE,
+                write_mask: wgpu::ColorWrite::ALL,
+            }],
+            depth_stencil_state: None,
+            vertex_state: vertex_state.clone(),
+            sample_count: msaa_samples,
+            sample_mask: !0,
+            alpha_to_coverage_enabled: false,
+        })
+    ;
+    
+    (scene_bind_group_layout, scene_pipeline_layout, scene_pipeline)
+}
+
+fn init_scene_data(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue
+) -> (wgpu::Buffer, wgpu::Buffer, usize, wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
+    
+    log::info!("Initializing buffers & textures...");
+    let (vertex_data, index_data) = create_test_mesh();
+
+    let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Vertex Buffer"),
+        contents: bytemuck::cast_slice(&vertex_data),
+        usage: wgpu::BufferUsage::VERTEX,
+    });
+
+    let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Index Buffer"),
+        contents: bytemuck::cast_slice(&index_data),
+        usage: wgpu::BufferUsage::INDEX,
+    });
+
+    let size = 1048u32;
+    let texels = create_mandelbrot_texture(size as usize);
+    let texture_extent = wgpu::Extent3d {
+        width: size,
+        height: size,
+        depth: 1,
+    };
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: texture_extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::COPY_DST,
+    });
+    
+    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    queue.write_texture(
+        wgpu::TextureCopyView {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+        },
+        &texels,
+        wgpu::TextureDataLayout {
+            offset: 0,
+            bytes_per_row: 4 * size,
+            rows_per_image: 0,
+        },
+        texture_extent,
+    );
+
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    (vertex_buf, index_buf, index_data.len(), texture, texture_view, sampler)
+}
+
+fn init_imgui(
+    window: &winit::window::Window,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture_format: wgpu::TextureFormat,
+    texture_extent: wgpu::Extent3d,
+) -> (imgui::Context, 
+      imgui_winit_support::WinitPlatform,
+      imgui_wgpu::Renderer,
+      imgui_wgpu::Texture,
+      imgui::TextureId,
+) {
+    log::info!("Initializing imgui...");
+    let hidpi_factor = window.scale_factor();
+    let mut imgui = imgui::Context::create();
+    let mut platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
+    platform.attach_window(
+        imgui.io_mut(),
+        &window,
+        imgui_winit_support::HiDpiMode::Default,
+    );
+    imgui.set_ini_filename(None);
+
+    let font_size = (13.0 * hidpi_factor) as f32;
+    imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
+    imgui
+        .fonts()
+        .add_font(&[imgui::FontSource::DefaultFontData {
+            config: Some(imgui::FontConfig {
+                oversample_h: 1,
+                pixel_snap_h: true,
+                size_pixels: font_size,
+                ..Default::default()
+            }),
+        }]);
+
+    let imgui_render_config = imgui_wgpu::RendererConfig::new()
+        .set_texture_format(texture_format);
+
+    let mut imgui_renderer = imgui_wgpu::Renderer::new(
+        &mut imgui,
+        &device,
+        &queue,
+        imgui_render_config,
+    );
+
+    // Create imgui texture for drawing rendered textures in UI
+    let imgui_texture_config = imgui_wgpu::TextureConfig::new(texture_extent.width,
+                                                              texture_extent.height);
+    let imgui_texture = imgui_wgpu::Texture::new(
+        device,
+        &imgui_renderer,
+        imgui_texture_config,
+    );
+
+    let imgui_texture_id = imgui_renderer.textures.insert(imgui_texture);
+
+    (imgui, platform, imgui_renderer, imgui_texture, imgui_texture_id)
+}
+
+fn imgui_build_ui(ui: &imgui::Ui, state: &UiState) {
+    let imgui_window = imgui::Window::new(im_str!("Learning WGPU"));
+    imgui_window
+        .size([300.0, 300.0], imgui::Condition::FirstUseEver)
+        .build(ui, || {
+            ui.text(im_str!("Frametime: {:?}", state.last_frame.elapsed()));
+            ui.separator();
+            let mouse_pos = ui.io().mouse_pos;
+            ui.text(im_str!(
+                "Mouse Position: ({:.1},{:.1})",
+                mouse_pos[0],
+                mouse_pos[1],
+            ));
+
+            ui.separator();
+            if ui.button(im_str!("Toggle Demo"), [100., 20.]) {
+                state.show_demo = !state.show_demo
+            }
+            ui.separator();
+
+            imgui::Slider::new(im_str!("Camera Rotation"))
+                .range(0.0..=6.0)
+                .build(&ui, &mut state.camera_state);
+            ui.separator();
+            imgui::Slider::new(im_str!("Texture Zoom"))
+                .range(0.001..=1.0)
+                .build(&ui, &mut state.zoom);
+            ui.separator();
+            imgui::Slider::new(im_str!("Texture X offset"))
+                .range(0.00..=1.0)
+                .build(&ui, &mut state.offset[0]);
+            ui.separator();
+            imgui::Slider::new(im_str!("Texture Y offset"))
+                .range(0.00..=1.0)
+                .build(&ui, &mut state.offset[1]);
+            ui.separator();
+            imgui::Image::new(state.texture_id, [500.0, 500.0]).build(&ui);
+            ui.separator();
+        });
+    drop(imgui_window);
+    if state.show_demo {
+        ui.show_demo_window(&mut false);
+    }
+}
+
+fn imgui_draw_ui(platform: &imgui_winit_support::WinitPlatform,
+                 window: &winit::window::Window,
+                 device: &wgpu::Device,
+                 queue: &wgpu::Queue,
+                 renderer: &imgui_wgpu::Renderer,
+                 ui: &imgui::Ui,
+                 state: &UiState,
+                 render_view: &wgpu::TextureView,
+) {
+    if state.last_cursor != ui.mouse_cursor() {
+        state.last_cursor = ui.mouse_cursor();
+        platform.prepare_render(&ui, &window);
+    }
+
+    let mut encoder: wgpu::CommandEncoder = device
+        .create_command_encoder(
+            &wgpu::CommandEncoderDescriptor{label: None }
+        );
+    let mut imgui_renderpass = encoder
+        .begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments:
+                    &[wgpu::RenderPassColorAttachmentDescriptor {
+                    attachment: &render_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: true,
+                },
+            }],
+            depth_stencil_attachment: None,
+    });
+
+    renderer.render(
+        ui.render(),
+        queue,
+        device,
+        &mut imgui_renderpass
+    ).expect("Rendering failed");
+    
+    drop(imgui_renderpass);
+    queue.submit(Some(encoder.finish()));
 }
 
 fn update_camera(
@@ -329,7 +667,7 @@ fn main() {
         .unwrap();
 
     // Init GPU Handle
-    let h = futures::executor::block_on(setup(&window));
+    let h = futures::executor::block_on(init_gpu(&window));
 
     // define sample count for MSAA
     let msaa_samples = 8;
@@ -361,14 +699,14 @@ fn main() {
         swapchain_desc.height as usize
     );
     // The output buffer lets us retrieve the data as an array
-    let capture_buffer = h.device.create_buffer(&wgpu::BufferDescriptor {
+    let _capture_buffer = h.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: (capture_buffer_dimensions.padded_bytes_per_row 
                * capture_buffer_dimensions.height) as u64,
         usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
         mapped_at_creation: false,
     });
-    let capture_texture_extent = wgpu::Extent3d {
+    let initial_extent = wgpu::Extent3d {
         width: capture_buffer_dimensions.width as u32,
         height: capture_buffer_dimensions.height as u32,
         depth: 1,
@@ -380,7 +718,7 @@ fn main() {
     let capture_count = 10;
     let capture_msaa_texture :Vec<wgpu::Texture> = (0..capture_count).map(|_| {
         h.device.create_texture(&wgpu::TextureDescriptor {
-            size: capture_texture_extent,
+            size: initial_extent,
             mip_level_count: 1,
             sample_count: msaa_samples,
             dimension: wgpu::TextureDimension::D2,
@@ -393,7 +731,7 @@ fn main() {
     // Create 10 resolve targets for capture
     let mut capture_resolve_texture : Vec<wgpu::Texture> = (0..capture_count).map(|_| {
         h.device.create_texture(&wgpu::TextureDescriptor {
-            size: capture_texture_extent,
+            size: initial_extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -412,411 +750,74 @@ fn main() {
 
     let capture_resolve_view = capture_resolve_texture[2]
         .create_view(&wgpu::TextureViewDescriptor::default());
-    
-    log::info!("Initializing Rendering Pipelines...");
-    let scene_bind_group_layout = h.device
-        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStage::VERTEX,
-                    ty: wgpu::BindingType::UniformBuffer {
-                        dynamic: false,
-                        min_binding_size: wgpu::BufferSize::new(64),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: wgpu::BindingType::SampledTexture {
-                        multisampled: false,
-                        component_type: wgpu::TextureComponentType::Float,
-                        dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler {
-                        comparison: false,
-                    },
-                    count: None,
-                },
-            ],
-        })
-    ;
 
-    let capture_bind_group_layout = h.device
-        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStage::VERTEX,
-                    ty: wgpu::BindingType::UniformBuffer {
-                        dynamic: false,
-                        min_binding_size: wgpu::BufferSize::new(
-                            (std::mem::size_of::<cgmath::Matrix4::<f32>>() 
-                             * capture_count) as u64
-                        ),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: wgpu::BindingType::SampledTexture {
-                        multisampled: false,
-                        component_type: wgpu::TextureComponentType::Float,
-                        dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None, 
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler {
-                        comparison: false,
-                    },
-                    count: None,
-                },
-            ],
-        })
-    ;
+    // UI
+    let (mut imgui_context,
+         imgui_platform,
+         imgui_renderer,
+         _imgui_texture,
+         imgui_texture_id,
+    ) = init_imgui(&window, &h.device, &h.queue, swapchain_desc.format, initial_extent);
 
-    let scene_pipeline_layout = h.device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Scene pipeline layout"),
-            bind_group_layouts: &[&scene_bind_group_layout],
-            push_constant_ranges: &[wgpu::PushConstantRange {
-                stages: wgpu::ShaderStage::FRAGMENT,
-                range: (0..16),
-            }],
-        })
-    ;
-    
-    let capture_pipeline_layout = h.device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Capture pipeline layout"),
-            bind_group_layouts: &[&capture_bind_group_layout],
-            push_constant_ranges: &[wgpu::PushConstantRange {
-                stages: wgpu::ShaderStage::FRAGMENT,
-                range: (0..16),
-            }],
-        })
-    ;
+    // Scene Config
+    let (bind_group_layout,
+         _pipeline_layout,
+         pipeline
+    ) = init_scene_config(&h.device, swapchain_desc.format, msaa_samples);
 
-    let vertex_size = std::mem::size_of::<Vertex>();
-    let vertex_state = wgpu::VertexStateDescriptor {
-        index_format: wgpu::IndexFormat::Uint16,
-        vertex_buffers: &[wgpu::VertexBufferDescriptor {
-            stride: vertex_size as wgpu::BufferAddress,
-            step_mode: wgpu::InputStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttributeDescriptor {
-                    format: wgpu::VertexFormat::Float4,
-                    offset: 0,
-                    shader_location: 0,
-                },
-                wgpu::VertexAttributeDescriptor {
-                    format: wgpu::VertexFormat::Float2,
-                    offset: 4 * 4, // TODO: cleanup
-                    shader_location: 1,
-                },
-            ],
-        }],
-    };
-
-    let scene_vert_shader = h.device
-        .create_shader_module(wgpu::include_spirv!("../shaders/scene.vert.spv"));
-    let scene_frag_shader = h.device
-        .create_shader_module(wgpu::include_spirv!("../shaders/scene.frag.spv"));
-    let capture_vert_shader = h.device
-        .create_shader_module(wgpu::include_spirv!("../shaders/capture.vert.spv"));
-    let capture_frag_shader = h.device
-        .create_shader_module(wgpu::include_spirv!("../shaders/capture.frag.spv"));
-
-    let scene_pipeline = h.device
-        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Scene Pipeline"),
-            layout: Some(&scene_pipeline_layout),
-            vertex_stage: wgpu::ProgrammableStageDescriptor {
-                module: &scene_vert_shader,
-                entry_point: "main",
-            },
-            fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
-                module: &scene_frag_shader,
-                entry_point: "main",
-            }),
-            rasterization_state: Some(wgpu::RasterizationStateDescriptor {
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode:wgpu::CullMode::Back,
-                ..Default::default()
-            }),
-            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
-            color_states: &[wgpu::ColorStateDescriptor {
-                format: swapchain_desc.format,
-                color_blend: wgpu::BlendDescriptor::REPLACE,
-                alpha_blend: wgpu::BlendDescriptor::REPLACE,
-                write_mask: wgpu::ColorWrite::ALL,
-            }],
-            depth_stencil_state: None,
-            vertex_state: vertex_state.clone(),
-            sample_count: msaa_samples,
-            sample_mask: !0,
-            alpha_to_coverage_enabled: false,
-        })
-    ;
-
-    let capture_pipeline = h.device
-        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Capture pipeline"),
-            layout: Some(&capture_pipeline_layout),
-            vertex_stage: wgpu::ProgrammableStageDescriptor {
-                module: &capture_vert_shader,
-                entry_point: "main",
-            },
-            fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
-                module: &capture_frag_shader,
-                entry_point: "main",
-            }),
-            rasterization_state: Some(wgpu::RasterizationStateDescriptor {
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode:wgpu::CullMode::Back,
-                ..Default::default()
-            }),
-            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
-            color_states: &[wgpu::ColorStateDescriptor {
-                format: capture_format,
-                color_blend: wgpu::BlendDescriptor::REPLACE,
-                alpha_blend: wgpu::BlendDescriptor::REPLACE,
-                write_mask: wgpu::ColorWrite::ALL,
-            }],
-            depth_stencil_state: None,
-            vertex_state: vertex_state.clone(),
-            sample_count: msaa_samples,
-            sample_mask: !0,
-            alpha_to_coverage_enabled: false,
-        }
-    );
-
-    log::info!("Initializing buffers & textures...");
-    let (vertex_data, index_data) = create_test_mesh();
-
-    let vertex_buf = h.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Vertex Buffer"),
-        contents: bytemuck::cast_slice(&vertex_data),
-        usage: wgpu::BufferUsage::VERTEX,
-    });
-
-    let index_buf = h.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Index Buffer"),
-        contents: bytemuck::cast_slice(&index_data),
-        usage: wgpu::BufferUsage::INDEX,
-    });
-
-    let size = 1048u32;
-    let texels = create_mandelbrot_texture(size as usize);
-    let texture_extent = wgpu::Extent3d {
-        width: size,
-        height: size,
-        depth: 1,
-    };
-
-    let texture = h.device.create_texture(&wgpu::TextureDescriptor {
-        label: None,
-        size: texture_extent,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::COPY_DST,
-    });
-    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    h.queue.write_texture(
-        wgpu::TextureCopyView {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-        },
-        &texels,
-        wgpu::TextureDataLayout {
-            offset: 0,
-            bytes_per_row: 4 * size,
-            rows_per_image: 0,
-        },
-        texture_extent,
-    );
-
-    let sampler = h.device.create_sampler(&wgpu::SamplerDescriptor {
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        address_mode_w: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Nearest,
-        min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::FilterMode::Nearest,
-        ..Default::default()
-    });
+    // Scene Data
+    let (vertex_buf,
+         index_buf,
+         index_count,
+         _mandelbrot_texture,
+         mandelbrot_view,
+         mandelbrot_sampler
+    ) = init_scene_data(&h.device, &h.queue); 
 
     log::info!("Creating Cameras...");
-    let scene_camera = create_test_camera(
-        swapchain_desc.width as f32 / swapchain_desc.height as f32,
-        0.0,
-    );
-    let scene_camera_ref: &[f32; 16] = scene_camera.as_ref();
-    let scene_camera_buf: wgpu::Buffer = h.device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Uniform Buffer"),
-            contents: bytemuck::cast_slice(scene_camera_ref),
-            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
-        }
-    );
-
-    // store as vector of primatives so that bytemuck works
-    let capture_camera : Vec<[[f32; 4]; 4]> = (0..capture_count).map(|x| {
+    let camera_array : Vec<[[f32; 4]; 4]> = (0..capture_count).map(|x| {
         create_test_camera(
             swapchain_desc.width as f32 / swapchain_desc.height as f32,
             x as f32).into()
     }).collect();    
-    let capture_camera_buf = h.device
+
+    let camera_array_buf = h.device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(&capture_camera),
+            contents: bytemuck::cast_slice(&camera_array),
             usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
         });
 
-    log::info!("Creating bind groups...");
+    log::info!("Creating bind group...");
     let scene_bind_group = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        layout: &scene_bind_group_layout,
+        layout: &bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::Buffer(scene_camera_buf.slice(..)), 
+                resource: wgpu::BindingResource::Buffer(camera_array_buf.slice(..)), 
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&texture_view),
+                resource: wgpu::BindingResource::TextureView(&mandelbrot_view),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: wgpu::BindingResource::Sampler(&sampler),
+                resource: wgpu::BindingResource::Sampler(&mandelbrot_sampler),
             },
         ],
         label: Some("Scene Bind Group"),
     });
 
-    let capture_bind_group = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        layout: &capture_bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(capture_camera_buf.slice(..)),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&texture_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
-        label: Some("Capture Bind Group"),
-    });
-
-    log::info!("Initializing imgui...");
-    let hidpi_factor = window.scale_factor();
-    let mut imgui = imgui::Context::create();
-    let mut platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
-    platform.attach_window(
-        imgui.io_mut(),
-        &window,
-        imgui_winit_support::HiDpiMode::Default,
-    );
-    imgui.set_ini_filename(None);
-
-    let font_size = (13.0 * hidpi_factor) as f32;
-    imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
-    imgui
-        .fonts()
-        .add_font(&[imgui::FontSource::DefaultFontData {
-            config: Some(imgui::FontConfig {
-                oversample_h: 1,
-                pixel_snap_h: true,
-                size_pixels: font_size,
-                ..Default::default()
-            }),
-        }]);
-
-    let imgui_render_config = imgui_wgpu::RendererConfig::new()
-        .set_texture_format(swapchain_desc.format);
-
-    let mut imgui_renderer = imgui_wgpu::Renderer::new(
-        &mut imgui,
-        &h.device,
-        &h.queue,
-        imgui_render_config,
-    );
-
-    // Create imgui texture for drawing rendered textures in UI
-
-    let imgui_texture_bind_group_layout = h.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: None, 
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStage::FRAGMENT,
-                ty: wgpu::BindingType::SampledTexture {
-                    multisampled: false,
-                    component_type: wgpu::TextureComponentType::Float,
-                    dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStage::FRAGMENT,
-                ty: wgpu::BindingType::Sampler { comparison: false },
-                count: None,
-            },
-        ],
-    });
-    let imgui_texture_bind_group = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &imgui_texture_bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&capture_resolve_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
-    });
-
-    let imgui_texture_view = capture_resolve_texture[2]
-        .create_view(&wgpu::TextureViewDescriptor::default());
-    let imgui_texture = imgui_wgpu::Texture::from_raw_parts(
-        capture_resolve_texture.remove(2),
-        imgui_texture_view,
-        imgui_texture_bind_group,
-        capture_texture_extent
-    );
-
-    let imgui_texture_id = imgui_renderer.textures.insert(imgui_texture);
-
     // UI States
-    let mut last_frame = std::time::Instant::now();
-    let mut show_demo = false;
-    let mut last_cursor = None;
-    let mut camera_state: f32 = 0.0;
-    let mut zoom: f32 = 0.1;
-    let mut offset: [f32; 2] = [0.0, 0.0];
+    let mut ui_state = UiState {
+        last_frame: std::time::Instant::now(),
+        show_demo: false,
+        last_cursor: None,
+        camera_state: 0.0,
+        zoom: 0.1,
+        offset: [0.0, 0.0],
+        texture_id: imgui_texture_id,
+    };
 
     log::info!("Starting event loop!");
     let (_pool, spawner) = {
@@ -831,7 +832,7 @@ fn main() {
         let _ = (
             &h,
             &swapchain_desc,
-            &scene_camera_buf,
+            &camera_array_buf,
         );
         
         // Set control flow to wait min(next event, 10ms) 
@@ -858,8 +859,8 @@ fn main() {
                     &swapchain_desc,
                     &h.device,
                     &h.queue,
-                    &scene_camera_buf,
-                    camera_state,
+                    &camera_array_buf,
+                    ui_state.camera_state,
                     &mut msaa_view,
                     msaa_samples,
                 );
@@ -881,10 +882,9 @@ fn main() {
                 _ => {}
             },
             Event::RedrawRequested(_) => {
-                let delta_s = last_frame.elapsed();
                 let now = Instant::now();
-                imgui.io_mut().update_delta_time(now - last_frame);
-                last_frame = now;
+                imgui_context.io_mut().update_delta_time(now - ui_state.last_frame);
+                ui_state.last_frame = now;
                 let frame = match swapchain.get_current_frame() { Ok(frame) => frame,
                     Err(e) => {
                         log::warn!("dropped frame: {:?}", e);
@@ -897,7 +897,12 @@ fn main() {
                     }
                 };
 
-                update_camera(&swapchain_desc, &h.queue, &scene_camera_buf, camera_state);
+                update_camera(
+                    &swapchain_desc,
+                    &h.queue,
+                    &camera_array_buf,
+                    ui_state.camera_state
+                );
 
                 // Render Scene
                 render(
@@ -905,114 +910,36 @@ fn main() {
                     &frame.output.view,
                     &h.device,
                     &h.queue,
-                    &scene_pipeline,
+                    &pipeline,
                     &scene_bind_group,
                     &vertex_buf,
                     &index_buf,
-                    index_data.len(),
-                    push_constant(zoom, offset),
+                    index_count,
+                    push_constant(ui_state.zoom, ui_state.offset),
                     &spawner
                 );
-
-                render(
-                    &capture_msaa_view[2],
-                    &capture_resolve_view,
-                    &h.device,
-                    &h.queue,
-                    &capture_pipeline,
-                    &capture_bind_group,
-                    &vertex_buf,
-                    &index_buf,
-                    index_data.len(),
-                    push_constant(zoom, offset),
-                    &spawner
-                );
-
-                // Render UI
-                platform
-                    .prepare_frame(imgui.io_mut(), &window)
-                    .expect("Failed to prepare frame");
-                let ui = imgui.frame();
-                {
-                    let imgui_window = imgui::Window::new(im_str!("Hello World"));
-                    imgui_window
-                        .size([300.0, 300.0], imgui::Condition::FirstUseEver)
-                        .build(&ui, || {
-                            ui.text(im_str!("Frametime: {:?}", delta_s));
-                            ui.separator();
-                            let mouse_pos = ui.io().mouse_pos;
-                            ui.text(im_str!(
-                                "Mouse Position: ({:.1},{:.1})",
-                                mouse_pos[0],
-                                mouse_pos[1],
-                            ));
-
-                            ui.separator();
-                            if ui.button(im_str!("Toggle Demo"), [100., 20.]) {
-                                show_demo = !show_demo
-                            }
-                            ui.separator();
-
-                            imgui::Slider::new(im_str!("Camera Rotation"))
-                                .range(0.0..=6.0)
-                                .build(&ui, &mut camera_state);
-                            ui.separator();
-                            imgui::Slider::new(im_str!("Texture Zoom"))
-                                .range(0.001..=1.0)
-                                .build(&ui, &mut zoom);
-                            ui.separator();
-                            imgui::Slider::new(im_str!("Texture X offset"))
-                                .range(0.00..=1.0)
-                                .build(&ui, &mut offset[0]);
-                            ui.separator();
-                            imgui::Slider::new(im_str!("Texture Y offset"))
-                                .range(0.00..=1.0)
-                                .build(&ui, &mut offset[1]);
-                            ui.separator();
-                            imgui::Image::new(imgui_texture_id, [500.0, 500.0]).build(&ui);
-                            ui.separator();
-                        });
-                    if show_demo {
-                        ui.show_demo_window(&mut false);
-                    }
-                }
-                if last_cursor != Some(ui.mouse_cursor()) {
-                    last_cursor = Some(ui.mouse_cursor());
-                    platform.prepare_render(&ui, &window);
-                }
-
-                let mut encoder: wgpu::CommandEncoder = h
-                    .device
-                    .create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor{label: None }
-                    );
-                let mut imgui_renderpass = encoder
-                    .begin_render_pass(&wgpu::RenderPassDescriptor {
-                        color_attachments:
-                                &[wgpu::RenderPassColorAttachmentDescriptor {
-                                attachment: &frame.output.view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Load,
-                                    store: true,
-                            },
-                        }],
-                        depth_stencil_attachment: None,
-                });
-
-                imgui_renderer.render(
-                    ui.render(),
-                    &h.queue,
-                    &h.device,
-                    &mut imgui_renderpass
-                ).expect("Rendering failed");
                 
-                drop(imgui_renderpass);
-                h.queue.submit(Some(encoder.finish()));
+                // Render UI
+                imgui_platform
+                    .prepare_frame(imgui_context.io_mut(), &window)
+                    .expect("Failed to prepare frame");
+                
+                let ui = imgui_context.frame();
+                imgui_build_ui(&ui, &mut ui_state);
+                imgui_draw_ui(
+                    &imgui_platform,
+                    &window,
+                    &h.device,
+                    &h.queue,
+                    &imgui_renderer,
+                    &ui,
+                    &ui_state,
+                    &frame.output.view
+                );
            }
             _ => {}
         }
-        platform.handle_event(imgui.io_mut(), &window, &event)
+        imgui_platform.handle_event(imgui_context.io_mut(), &window, &event)
     });
 }
 
