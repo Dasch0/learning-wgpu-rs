@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use wgpu::util::DeviceExt;
 use winit::{
     event::*,
@@ -21,7 +22,8 @@ pub struct UiState {
     last_frame: std::time::Instant,
     show_demo: bool,
     last_cursor: Option<imgui::MouseCursor>,
-    camera_state: f32,
+    scene_camera: u32,
+    viewport_camera: u32,
     zoom: f32,
     offset: [f32; 2],
     texture_id: imgui::TextureId,
@@ -157,16 +159,6 @@ fn create_mandelbrot_texture(size: usize) -> Vec<u8>{
         .collect()
 }
 
-fn create_test_camera(aspect_ratio: f32, pos: f32) -> cgmath::Matrix4<f32> {
-    let proj = cgmath::perspective(cgmath::Deg(45f32), aspect_ratio, 1.0, 10.0);
-    let view = cgmath::Matrix4::look_at(
-        cgmath::Point3::new(pos, -5.0, 3.0),
-        cgmath::Point3::new(0f32, 0.0, 0.0),
-        cgmath::Vector3::unit_z(),
-    );
-    let correction = OPENGL_TO_WGPU_MATRIX;
-    correction * proj * view
-}
 
 async fn init_gpu (window: &Window) -> Handle {
     log::info!("Initializing instance...");
@@ -194,8 +186,8 @@ async fn init_gpu (window: &Window) -> Handle {
     let required_features = 
         wgpu::Features::default() 
         | wgpu::Features::PUSH_CONSTANTS
-        //| wgpu::Features::UNSIZED_BINDING_ARRAY
-        //| wgpu::Features::SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
+        | wgpu::Features::UNSIZED_BINDING_ARRAY
+        | wgpu::Features::SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
         | wgpu::Features::SAMPLED_TEXTURE_BINDING_ARRAY;
 
     let adapter_features = _adapter.features();
@@ -231,10 +223,56 @@ async fn init_gpu (window: &Window) -> Handle {
     }
 }
 
+fn build_swapchain(
+    device: &wgpu::Device,
+    surface: &wgpu::Surface,
+    size: winit::dpi::PhysicalSize<u32>
+) -> (wgpu::SwapChainDescriptor, wgpu::SwapChain) {
+    log::info!("Initializing swapchain...");
+    let swapchain_desc = wgpu::SwapChainDescriptor {
+        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT,
+        format: wgpu::TextureFormat::Bgra8UnormSrgb,
+        width: size.width,
+        height: size.height,
+        present_mode: wgpu::PresentMode::Immediate,
+    };
+    let swapchain = device.create_swap_chain(surface, &swapchain_desc);
+    (swapchain_desc, swapchain)
+}
+
+// TODO: support multiple render target sizes 
+fn init_render_targets(
+    device: &wgpu::Device,
+    count: usize,
+    extent: wgpu::Extent3d,
+    format: wgpu::TextureFormat,
+    msaa_samples: usize 
+) -> (Vec<wgpu::Texture>, Vec<wgpu::TextureView>) {
+    // Create MSAA textures 
+    let target_list: Vec<wgpu::Texture> = (0..count).map(|_| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            size: extent,
+            mip_level_count: 1,
+            sample_count: msaa_samples as u32,
+            dimension: wgpu::TextureDimension::D2,
+            format: format,
+            usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
+            label: None,
+        })
+    }).collect();
+
+    // Create views for capture msaa and resolve views
+    let target_view_list: Vec<wgpu::TextureView> = (0..count).map(|i| {
+        target_list[i].create_view(&wgpu::TextureViewDescriptor::default())
+    }).collect();
+
+    (target_list, target_view_list)
+}
+
 fn init_scene_config(
     device: &wgpu::Device,
     texture_format: wgpu::TextureFormat,
-    msaa_samples: u32
+    msaa_samples: usize 
 ) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout, wgpu::RenderPipeline) {
     
     log::info!("Initializing Rendering Pipelines...");
@@ -336,7 +374,7 @@ fn init_scene_config(
             }],
             depth_stencil_state: None,
             vertex_state: vertex_state.clone(),
-            sample_count: msaa_samples,
+            sample_count: msaa_samples as u32, 
             sample_mask: !0,
             alpha_to_coverage_enabled: false,
         })
@@ -421,7 +459,6 @@ fn init_imgui(
 ) -> (imgui::Context, 
       imgui_winit_support::WinitPlatform,
       imgui_wgpu::Renderer,
-      imgui_wgpu::Texture,
       imgui::TextureId,
 ) {
     log::info!("Initializing imgui...");
@@ -459,20 +496,25 @@ fn init_imgui(
     );
 
     // Create imgui texture for drawing rendered textures in UI
-    let imgui_texture_config = imgui_wgpu::TextureConfig::new(texture_extent.width,
-                                                              texture_extent.height);
+    let imgui_texture_config = imgui_wgpu::TextureConfig::new(
+        texture_extent.width,
+        texture_extent.height
+    ).set_usage(wgpu::TextureUsage::COPY_DST
+                | wgpu::TextureUsage::SAMPLED
+                | wgpu::TextureUsage::OUTPUT_ATTACHMENT
+    );
+
     let imgui_texture = imgui_wgpu::Texture::new(
         device,
         &imgui_renderer,
         imgui_texture_config,
     );
-
     let imgui_texture_id = imgui_renderer.textures.insert(imgui_texture);
 
-    (imgui, platform, imgui_renderer, imgui_texture, imgui_texture_id)
+    (imgui, platform, imgui_renderer, imgui_texture_id)
 }
 
-fn imgui_build_ui(ui: &imgui::Ui, state: &UiState) {
+fn imgui_build_ui(ui: &imgui::Ui, state: &mut UiState) {
     let imgui_window = imgui::Window::new(im_str!("Learning WGPU"));
     imgui_window
         .size([300.0, 300.0], imgui::Condition::FirstUseEver)
@@ -491,10 +533,13 @@ fn imgui_build_ui(ui: &imgui::Ui, state: &UiState) {
                 state.show_demo = !state.show_demo
             }
             ui.separator();
-
-            imgui::Slider::new(im_str!("Camera Rotation"))
-                .range(0.0..=6.0)
-                .build(&ui, &mut state.camera_state);
+            imgui::Slider::new(im_str!("Scene Camera"))
+                .range(0..=10)
+                .build(&ui, &mut state.scene_camera );
+            ui.separator();
+            imgui::Slider::new(im_str!("Viewport Camera"))
+                .range(0..=10)
+                .build(&ui, &mut state.viewport_camera);
             ui.separator();
             imgui::Slider::new(im_str!("Texture Zoom"))
                 .range(0.001..=1.0)
@@ -511,21 +556,21 @@ fn imgui_build_ui(ui: &imgui::Ui, state: &UiState) {
             imgui::Image::new(state.texture_id, [500.0, 500.0]).build(&ui);
             ui.separator();
         });
-    drop(imgui_window);
+    
     if state.show_demo {
         ui.show_demo_window(&mut false);
     }
 }
 
-fn imgui_draw_ui(platform: &imgui_winit_support::WinitPlatform,
+fn imgui_draw_ui(platform: &mut imgui_winit_support::WinitPlatform,
                  window: &winit::window::Window,
                  device: &wgpu::Device,
                  queue: &wgpu::Queue,
-                 renderer: &imgui_wgpu::Renderer,
-                 ui: &imgui::Ui,
-                 state: &UiState,
+                 renderer: &mut imgui_wgpu::Renderer,
+                 ui: imgui::Ui,
+                 state: &mut UiState,
                  render_view: &wgpu::TextureView,
-) {
+) { 
     if state.last_cursor != ui.mouse_cursor() {
         state.last_cursor = ui.mouse_cursor();
         platform.prepare_render(&ui, &window);
@@ -560,55 +605,61 @@ fn imgui_draw_ui(platform: &imgui_winit_support::WinitPlatform,
     queue.submit(Some(encoder.finish()));
 }
 
-fn update_camera(
-    swapchain_desc: &wgpu::SwapChainDescriptor,
-    queue: &wgpu::Queue,
-    camera_buf: &wgpu::Buffer,
-    camera_state: f32
-) {
-    let camera = create_test_camera(
-        swapchain_desc.width as f32 / swapchain_desc.height as f32,
-        camera_state,
+fn build_camera(aspect_ratio: f32, pos: [f32; 3]) -> [[f32; 4]; 4] {
+    let proj = cgmath::perspective(cgmath::Deg(45f32), aspect_ratio, 1.0, 10.0);
+    let view = cgmath::Matrix4::look_at(
+        cgmath::Point3::from(pos),
+        cgmath::Point3::new(0f32, 0.0, 0.0),
+        cgmath::Vector3::unit_z(),
     );
-    let camera_ref: &[f32;16] = camera.as_ref();
-    queue.write_buffer(&camera_buf, 0, bytemuck::cast_slice(camera_ref));
+    let correction = OPENGL_TO_WGPU_MATRIX;
+    (correction * proj * view).into()
 }
 
-fn create_msaa_target(swapchain_desc: &wgpu::SwapChainDescriptor,
-                      device: &wgpu::Device,
-                      msaa_samples: u32,
-) -> wgpu::TextureView {
-    let multisampled_texture_extent = wgpu::Extent3d {
-        width: swapchain_desc.width,
-        height: swapchain_desc.height,
-        depth: 1,
-    };
-    let multisampled_frame_descriptor = &wgpu::TextureDescriptor {
-        size: multisampled_texture_extent,
-        mip_level_count: 1,
-        sample_count: msaa_samples,
-        dimension: wgpu::TextureDimension::D2,
-        format: swapchain_desc.format,
-        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT,
-        label: None,
-    };
-    
-    device
-        .create_texture(multisampled_frame_descriptor)
-        .create_view(&wgpu::TextureViewDescriptor::default())
-}
-
-fn resize(
-    swapchain_desc: &wgpu::SwapChainDescriptor,
+fn init_camera_list(
     device: &wgpu::Device,
+    count: usize,
+    extent: wgpu::Extent3d,
+) -> (Vec<[[f32; 4]; 4]>, wgpu::Buffer, Vec<[f32; 3]>) {
+    
+    log::info!("Creating Cameras...");
+    let camera_list : Vec<[[f32; 4]; 4]> = (0..count).into_par_iter().map(|x| {
+        build_camera(
+            extent.width as f32 / extent.height as f32,
+            [x as f32, x as f32, x as f32],
+        )
+    }).collect();    
+
+    let camera_buf = device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&camera_list),
+            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+        })
+    ;
+    (camera_list, camera_buf, vec![[0f32, 0.0, 0.0]; count])
+}
+
+// TODO: support camera rotations
+fn update_camera_list(
     queue: &wgpu::Queue,
+    camera_list: &mut Vec<[[f32; 4]; 4]>,
     camera_buf: &wgpu::Buffer,
-    camera_state: f32,
-    msaa_view: &mut wgpu::TextureView,
-    msaa_samples: u32,
-){
-    update_camera(swapchain_desc, queue, camera_buf, camera_state);
-    *msaa_view = create_msaa_target(swapchain_desc, device, msaa_samples);
+    position_list: &Vec<[f32; 3]>,
+    extent: wgpu::Extent3d,
+) {
+    camera_list
+        .par_iter_mut()
+        .zip(&position_list[..])
+        .for_each(|(out, pos)| {
+            *out = build_camera(
+                extent.width as f32 / extent.height as f32,
+                *pos
+            );
+        })
+    ;
+
+    queue.write_buffer(&camera_buf, 0, bytemuck::cast_slice(camera_list.as_ref()));
 }
 
 fn render<T:Pod>(
@@ -666,98 +717,36 @@ fn main() {
         .build(&event_loop)
         .unwrap();
 
-    // Init GPU Handle
+    // Constants
+    let msaa_samples = 8;
+    let texture_count = 10;
+
+    // Device, Queue, Surface 
     let h = futures::executor::block_on(init_gpu(&window));
 
-    // define sample count for MSAA
-    let msaa_samples = 8;
-
-    log::info!("Initializing swapchain...");
-    let mut swapchain_desc = wgpu::SwapChainDescriptor {
-        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT,
-        format: wgpu::TextureFormat::Bgra8UnormSrgb,
-        width: h.size.width,
-        height: h.size.height,
-        present_mode: wgpu::PresentMode::Immediate,
-    };
-    let mut swapchain = h
-        .device
-        .create_swap_chain(&h.surface, &swapchain_desc);
-
-    log::info!("Initializing MSAA target...");
-    let mut msaa_view = 
-        create_msaa_target(&swapchain_desc, &h.device, msaa_samples);
-
-    log::info!("Initializing screen capture target");
-    // It is a webgpu requirement that BufferCopyView.layout.bytes_per_row 
-    // % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT == 0
-    // So we calculate padded_bytes_per_row by rounding unpadded_bytes_per_row
-    // up to the next multiple of wgpu::COPY_BYTES_PER_ROW_ALIGNMENT.
-    // https://en.wikipedia.org/wiki/Data_structure_alignment#Computing_padding
-    let capture_buffer_dimensions = BufferDimensions::new(
-        swapchain_desc.width as usize,
-        swapchain_desc.height as usize
-    );
-    // The output buffer lets us retrieve the data as an array
-    let _capture_buffer = h.device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: (capture_buffer_dimensions.padded_bytes_per_row 
-               * capture_buffer_dimensions.height) as u64,
-        usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let initial_extent = wgpu::Extent3d {
-        width: capture_buffer_dimensions.width as u32,
-        height: capture_buffer_dimensions.height as u32,
+    // Swapchain
+    let (swapchain_desc, mut swapchain) = build_swapchain(&h.device, &h.surface, h.size);
+    let extent = wgpu::Extent3d{
+        width: swapchain_desc.width,
+        height: swapchain_desc.height,
         depth: 1,
     };
-    
-    let capture_format= wgpu::TextureFormat::Rgba8UnormSrgb;
 
-    // Create 10 multisampled textures for capture
-    let capture_count = 10;
-    let capture_msaa_texture :Vec<wgpu::Texture> = (0..capture_count).map(|_| {
-        h.device.create_texture(&wgpu::TextureDescriptor {
-            size: initial_extent,
-            mip_level_count: 1,
-            sample_count: msaa_samples,
-            dimension: wgpu::TextureDimension::D2,
-            format: capture_format,
-            usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
-            label: None,
-        })
-    }).collect();
-
-    // Create 10 resolve targets for capture
-    let mut capture_resolve_texture : Vec<wgpu::Texture> = (0..capture_count).map(|_| {
-        h.device.create_texture(&wgpu::TextureDescriptor {
-            size: initial_extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: capture_format,
-            usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT 
-                | wgpu::TextureUsage::COPY_SRC
-                | wgpu::TextureUsage::SAMPLED,
-            label: None,
-        })
-    }).collect();
-
-    // Create views for capture msaa and resolve views
-    let capture_msaa_view : Vec<wgpu::TextureView> = (0..capture_count).map(|i| {
-        capture_msaa_texture[i].create_view(&wgpu::TextureViewDescriptor::default())
-    }).collect();
-
-    let capture_resolve_view = capture_resolve_texture[2]
-        .create_view(&wgpu::TextureViewDescriptor::default());
+    // Render Targets
+    let (mut _target_list, mut target_view_list) = init_render_targets(
+        &h.device,
+        texture_count,
+        extent,
+        swapchain_desc.format,
+        msaa_samples
+    );
 
     // UI
     let (mut imgui_context,
-         imgui_platform,
-         imgui_renderer,
-         _imgui_texture,
+         mut imgui_platform,
+         mut imgui_renderer,
          imgui_texture_id,
-    ) = init_imgui(&window, &h.device, &h.queue, swapchain_desc.format, initial_extent);
+    ) = init_imgui(&window, &h.device, &h.queue, swapchain_desc.format, extent);
 
     // Scene Config
     let (bind_group_layout,
@@ -774,19 +763,11 @@ fn main() {
          mandelbrot_sampler
     ) = init_scene_data(&h.device, &h.queue); 
 
-    log::info!("Creating Cameras...");
-    let camera_array : Vec<[[f32; 4]; 4]> = (0..capture_count).map(|x| {
-        create_test_camera(
-            swapchain_desc.width as f32 / swapchain_desc.height as f32,
-            x as f32).into()
-    }).collect();    
-
-    let camera_array_buf = h.device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&camera_array),
-            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
-        });
+    // Cameras
+    let (mut camera_list,
+         camera_buf,
+         mut position_list,
+    ) = init_camera_list(&h.device, texture_count, extent);
 
     log::info!("Creating bind group...");
     let scene_bind_group = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -794,7 +775,7 @@ fn main() {
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::Buffer(camera_array_buf.slice(..)), 
+                resource: wgpu::BindingResource::Buffer(camera_buf.slice(..)), 
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -813,7 +794,8 @@ fn main() {
         last_frame: std::time::Instant::now(),
         show_demo: false,
         last_cursor: None,
-        camera_state: 0.0,
+        scene_camera: 0,
+        viewport_camera: 1, 
         zoom: 0.1,
         offset: [0.0, 0.0],
         texture_id: imgui_texture_id,
@@ -832,7 +814,7 @@ fn main() {
         let _ = (
             &h,
             &swapchain_desc,
-            &camera_array_buf,
+            &camera_buf,
         );
         
         // Set control flow to wait min(next event, 10ms) 
@@ -852,20 +834,32 @@ fn main() {
                 ..
             } => {
                 let size = window.inner_size();
+                let extent = wgpu::Extent3d {
+                    width: size.width,
+                    height: size.height,
+                    depth: 1,
+                };
+
                 log::info!("Resizing to {:?}", size);
-                swapchain_desc.width = if size.width == 0 {1} else { size.width };
-                swapchain_desc.height = if size.height == 0 {1} else { size.height };
-                resize(
-                    &swapchain_desc,
-                    &h.device,
+                build_swapchain(&h.device, &h.surface, size);
+                update_camera_list(
                     &h.queue,
-                    &camera_array_buf,
-                    ui_state.camera_state,
-                    &mut msaa_view,
-                    msaa_samples,
+                    &mut camera_list,
+                    &camera_buf,
+                    &position_list,
+                    extent,
                 );
-                swapchain = h.device.create_swap_chain(&h.surface, &swapchain_desc);
+                let (new_target_list, new_target_view_list) = init_render_targets(
+                    &h.device,
+                    texture_count,
+                    extent,
+                    swapchain_desc.format,
+                    msaa_samples
+                );
+                _target_list = new_target_list;
+                target_view_list = new_target_view_list;
             }
+            
             Event::WindowEvent {ref event, .. } => match event {
                 WindowEvent::KeyboardInput {
                     input:
@@ -897,16 +891,18 @@ fn main() {
                     }
                 };
 
-                update_camera(
-                    &swapchain_desc,
+                // Update cameras
+                update_camera_list(
                     &h.queue,
-                    &camera_array_buf,
-                    ui_state.camera_state
+                    &mut camera_list,
+                    &camera_buf,
+                    &position_list,
+                    extent
                 );
 
                 // Render Scene
                 render(
-                    &msaa_view,
+                    &target_view_list[ui_state.scene_camera as usize],
                     &frame.output.view,
                     &h.device,
                     &h.queue,
@@ -918,7 +914,25 @@ fn main() {
                     push_constant(ui_state.zoom, ui_state.offset),
                     &spawner
                 );
-                
+
+                // Render viewport 
+                render(
+                    &target_view_list[ui_state.scene_camera as usize],
+                    &imgui_renderer
+                        .textures
+                        .get(imgui_texture_id)
+                        .expect("invalid imgui_texture_id")
+                        .view(),
+                    &h.device,
+                    &h.queue,
+                    &pipeline,
+                    &scene_bind_group,
+                    &vertex_buf,
+                    &index_buf,
+                    index_count,
+                    push_constant(ui_state.zoom, ui_state.offset),
+                    &spawner
+                );
                 // Render UI
                 imgui_platform
                     .prepare_frame(imgui_context.io_mut(), &window)
@@ -927,19 +941,19 @@ fn main() {
                 let ui = imgui_context.frame();
                 imgui_build_ui(&ui, &mut ui_state);
                 imgui_draw_ui(
-                    &imgui_platform,
+                    &mut imgui_platform,
                     &window,
                     &h.device,
                     &h.queue,
-                    &imgui_renderer,
-                    &ui,
-                    &ui_state,
+                    &mut imgui_renderer,
+                    ui,
+                    &mut ui_state,
                     &frame.output.view
                 );
            }
             _ => {}
         }
-        imgui_platform.handle_event(imgui_context.io_mut(), &window, &event)
+        imgui_platform.handle_event(imgui_context.io_mut(), &window, &event);
     });
 }
 
