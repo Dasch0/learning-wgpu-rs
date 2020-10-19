@@ -6,7 +6,9 @@ layout(set = 0, binding = 1) uniform texture2D t_Color;
 layout(set = 0, binding = 2) uniform sampler s_Color;
 layout(push_constant) uniform framentPushConstants {
     float zoom;
+    float pad;
     vec2 offset;
+    int camera_index;
 } pc;
 void main() {
     vec4 tex = texture(

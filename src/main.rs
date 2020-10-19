@@ -22,8 +22,11 @@ pub struct UiState {
     last_frame: std::time::Instant,
     show_demo: bool,
     last_cursor: Option<imgui::MouseCursor>,
+    extent: wgpu::Extent3d,
+    camera_count: u32,
     scene_camera: u32,
     viewport_camera: u32,
+    viewport_scale: f32,
     zoom: f32,
     offset: [f32; 2],
     texture_id: imgui::TextureId,
@@ -57,40 +60,44 @@ fn vertex(pos: [i8; 3], tc:[i8; 2]) -> Vertex {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct PushConstant {
     _zoom: f32,
-    _offset: [f32; 2],
     _pad: f32,
+    _offset: [f32; 2],
+    _camera_index: u32,
+    _pad2: f32,
 }
 
-fn push_constant(zoom: f32, offset: [f32; 2]) -> PushConstant {
+fn push_constant(zoom: f32, offset: [f32; 2], camera_index: u32) -> PushConstant {
     PushConstant {
         _zoom: zoom,
+        _pad: 0.0,
         _offset: offset,
-        _pad: 0.0
+        _camera_index: camera_index,
+        _pad2: 0.0,
     }
 }
 
-struct BufferDimensions {
-    width: usize,
-    height: usize,
-    _unpadded_bytes_per_row: usize,
-    padded_bytes_per_row: usize,
-}
-
-impl BufferDimensions {
-    fn new(width: usize, height: usize) -> Self {
-        let bytes_per_pixel = std::mem::size_of::<u32>();
-        let unpadded_bytes_per_row = width * bytes_per_pixel;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
-        let padded_bytes_per_row_padding = (align - unpadded_bytes_per_row % align) % align;
-        let padded_bytes_per_row = unpadded_bytes_per_row + padded_bytes_per_row_padding;
-        Self {
-            width,
-            height,
-            _unpadded_bytes_per_row: unpadded_bytes_per_row,
-            padded_bytes_per_row,
-        }
-    }
-}
+//struct BufferDimensions {
+//    width: usize,
+//    height: usize,
+//    _unpadded_bytes_per_row: usize,
+//    padded_bytes_per_row: usize,
+//}
+//
+//impl BufferDimensions {
+//    fn new(width: usize, height: usize) -> Self {
+//        let bytes_per_pixel = std::mem::size_of::<u32>();
+//        let unpadded_bytes_per_row = width * bytes_per_pixel;
+//        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+//        let padded_bytes_per_row_padding = (align - unpadded_bytes_per_row % align) % align;
+//        let padded_bytes_per_row = unpadded_bytes_per_row + padded_bytes_per_row_padding;
+//        Self {
+//            width,
+//            height,
+//            _unpadded_bytes_per_row: unpadded_bytes_per_row,
+//            padded_bytes_per_row,
+//        }
+//    }
+//}
 
 fn create_test_mesh() -> (Vec<Vertex>, Vec<u16>) {
     let vertex_data = [
@@ -139,9 +146,8 @@ fn create_test_mesh() -> (Vec<Vertex>, Vec<u16>) {
 }
 
 fn create_mandelbrot_texture(size: usize) -> Vec<u8>{
-    use std::iter;
-    (0..size * size)
-        .flat_map(|id| {
+    (0..size * size).
+        into_par_iter().flat_map(|id| {
             let cx = 3.0 * (id % size) as f32 / (size - 1) as f32 - 2.0;
             let cy = 2.0 * (id / size) as f32 / (size - 1) as f32 - 1.0;
             let (mut x, mut y, mut count) = (cx, cy, 0);
@@ -151,14 +157,13 @@ fn create_mandelbrot_texture(size: usize) -> Vec<u8>{
                 y = 2.0 * old_x * y + cy;
                 count += 1;
             }
-            iter::once(0xFF - (count * 5) as u8)
-                .chain(iter::once(0xFF - (count * 15) as u8))
-                .chain(iter::once(0xFF - (count * 50) as u8))
-                .chain(iter::once(1))
+            rayon::iter::once(0xFF - (count * 5) as u8)
+                .chain(rayon::iter::once(0xFF - (count * 15) as u8))
+                .chain(rayon::iter::once(0xFF - (count * 50) as u8))
+                .chain(rayon::iter::once(1))
         })
         .collect()
 }
-
 
 async fn init_gpu (window: &Window) -> Handle {
     log::info!("Initializing instance...");
@@ -193,7 +198,7 @@ async fn init_gpu (window: &Window) -> Handle {
     let adapter_features = _adapter.features();
 
     let required_limits = wgpu::Limits {
-        max_push_constant_size: 16,
+        max_push_constant_size: std::mem::size_of::<PushConstant>() as u32,
         ..wgpu::Limits::default()
     };
 
@@ -283,9 +288,10 @@ fn init_scene_config(
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStage::VERTEX,
-                    ty: wgpu::BindingType::UniformBuffer {
+                    ty: wgpu::BindingType::StorageBuffer {
                         dynamic: false,
                         min_binding_size: wgpu::BufferSize::new(64),
+                        readonly: false,
                     },
                     count: None,
                 },
@@ -316,8 +322,8 @@ fn init_scene_config(
             label: Some("Scene pipeline layout"),
             bind_group_layouts: &[&scene_bind_group_layout],
             push_constant_ranges: &[wgpu::PushConstantRange {
-                stages: wgpu::ShaderStage::FRAGMENT,
-                range: (0..16),
+                stages: wgpu::ShaderStage::VERTEX | wgpu::ShaderStage::FRAGMENT,
+                range: (0..std::mem::size_of::<PushConstant>() as u32),
             }],
         })
     ;
@@ -386,7 +392,7 @@ fn init_scene_config(
 fn init_scene_data(
     device: &wgpu::Device,
     queue: &wgpu::Queue
-) -> (wgpu::Buffer, wgpu::Buffer, usize, wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
+) -> (wgpu::Buffer, wgpu::Buffer, usize, wgpu::Extent3d, wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
     
     log::info!("Initializing buffers & textures...");
     let (vertex_data, index_data) = create_test_mesh();
@@ -403,7 +409,7 @@ fn init_scene_data(
         usage: wgpu::BufferUsage::INDEX,
     });
 
-    let size = 1048u32;
+    let size = 256u32;
     let texels = create_mandelbrot_texture(size as usize);
     let texture_extent = wgpu::Extent3d {
         width: size,
@@ -447,7 +453,7 @@ fn init_scene_data(
         ..Default::default()
     });
 
-    (vertex_buf, index_buf, index_data.len(), texture, texture_view, sampler)
+    (vertex_buf, index_buf, index_data.len(), texture_extent, texture, texture_view, sampler)
 }
 
 fn init_imgui(
@@ -517,7 +523,7 @@ fn init_imgui(
 fn imgui_build_ui(ui: &imgui::Ui, state: &mut UiState) {
     let imgui_window = imgui::Window::new(im_str!("Learning WGPU"));
     imgui_window
-        .size([300.0, 300.0], imgui::Condition::FirstUseEver)
+        .size([500.0, 500.0], imgui::Condition::FirstUseEver)
         .build(ui, || {
             ui.text(im_str!("Frametime: {:?}", state.last_frame.elapsed()));
             ui.separator();
@@ -534,11 +540,11 @@ fn imgui_build_ui(ui: &imgui::Ui, state: &mut UiState) {
             }
             ui.separator();
             imgui::Slider::new(im_str!("Scene Camera"))
-                .range(0..=10)
+                .range(0..=state.camera_count-1)
                 .build(&ui, &mut state.scene_camera );
             ui.separator();
             imgui::Slider::new(im_str!("Viewport Camera"))
-                .range(0..=10)
+                .range(0..=state.camera_count-1)
                 .build(&ui, &mut state.viewport_camera);
             ui.separator();
             imgui::Slider::new(im_str!("Texture Zoom"))
@@ -553,13 +559,42 @@ fn imgui_build_ui(ui: &imgui::Ui, state: &mut UiState) {
                 .range(0.00..=1.0)
                 .build(&ui, &mut state.offset[1]);
             ui.separator();
-            imgui::Image::new(state.texture_id, [500.0, 500.0]).build(&ui);
+            imgui::Slider::new(im_str!("ViewPort scale"))
+                .range(0.001..=1.0)
+                .build(&ui, &mut state.viewport_scale);
+            imgui::Image::new(state.texture_id, [
+                state.extent.width as f32 * state.viewport_scale,
+                state.extent.height as f32 * state.viewport_scale
+            ]).build(&ui);
             ui.separator();
         });
     
     if state.show_demo {
         ui.show_demo_window(&mut false);
     }
+}
+
+fn imgui_resize_texture(
+    device: &wgpu::Device,
+    imgui_renderer: &mut imgui_wgpu::Renderer,
+    extent: wgpu::Extent3d,
+    imgui_texture_id: imgui::TextureId
+) { 
+    // Create imgui texture for drawing rendered textures in UI
+    let imgui_texture_config = imgui_wgpu::TextureConfig::new(
+        extent.width,
+        extent.height
+    ).set_usage(wgpu::TextureUsage::COPY_DST
+                | wgpu::TextureUsage::SAMPLED
+                | wgpu::TextureUsage::OUTPUT_ATTACHMENT
+    );
+    
+    let imgui_texture = imgui_wgpu::Texture::new(
+        device,
+        imgui_renderer,
+        imgui_texture_config,
+    );
+    imgui_renderer.textures.replace(imgui_texture_id, imgui_texture).expect("invalid imgui_texture_id");
 }
 
 fn imgui_draw_ui(platform: &mut imgui_winit_support::WinitPlatform,
@@ -605,8 +640,8 @@ fn imgui_draw_ui(platform: &mut imgui_winit_support::WinitPlatform,
     queue.submit(Some(encoder.finish()));
 }
 
-fn build_camera(aspect_ratio: f32, pos: [f32; 3]) -> [[f32; 4]; 4] {
-    let proj = cgmath::perspective(cgmath::Deg(45f32), aspect_ratio, 1.0, 10.0);
+fn build_camera(aspect_ratio: f32, pos: cgmath::Point3<f32>) -> [[f32; 4]; 4] {
+    let proj = cgmath::perspective(cgmath::Deg(45f32), aspect_ratio, 0.1, 100.0);
     let view = cgmath::Matrix4::look_at(
         cgmath::Point3::from(pos),
         cgmath::Point3::new(0f32, 0.0, 0.0),
@@ -620,13 +655,14 @@ fn init_camera_list(
     device: &wgpu::Device,
     count: usize,
     extent: wgpu::Extent3d,
-) -> (Vec<[[f32; 4]; 4]>, wgpu::Buffer, Vec<[f32; 3]>) {
+) -> (Vec<[[f32; 4]; 4]>, wgpu::Buffer, Vec<cgmath::Point3<f32>>) {
     
     log::info!("Creating Cameras...");
-    let camera_list : Vec<[[f32; 4]; 4]> = (0..count).into_par_iter().map(|x| {
+    let initial_pos = cgmath::Point3::<f32>::new(1.5, -5.0, 3.0);
+    let camera_list : Vec<[[f32; 4]; 4]> = (0..count).into_par_iter().map(|_| {
         build_camera(
             extent.width as f32 / extent.height as f32,
-            [x as f32, x as f32, x as f32],
+            initial_pos,
         )
     }).collect();    
 
@@ -634,10 +670,10 @@ fn init_camera_list(
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&camera_list),
-            usage: wgpu::BufferUsage::UNIFORM | wgpu::BufferUsage::COPY_DST,
+            usage: wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::COPY_DST,
         })
     ;
-    (camera_list, camera_buf, vec![[0f32, 0.0, 0.0]; count])
+    (camera_list, camera_buf, vec![initial_pos; count])
 }
 
 // TODO: support camera rotations
@@ -645,7 +681,7 @@ fn update_camera_list(
     queue: &wgpu::Queue,
     camera_list: &mut Vec<[[f32; 4]; 4]>,
     camera_buf: &wgpu::Buffer,
-    position_list: &Vec<[f32; 3]>,
+    position_list: &Vec<cgmath::Point3<f32>>,
     extent: wgpu::Extent3d,
 ) {
     camera_list
@@ -701,7 +737,7 @@ fn render<T:Pod>(
     renderpass.set_bind_group(0, &bind_group, &[]);
     renderpass.set_index_buffer(index_buf.slice(..));
     renderpass.set_vertex_buffer(0, vertex_buf.slice(..));
-    renderpass.set_push_constants(wgpu::ShaderStage::FRAGMENT, 0, bytemuck::cast_slice(&[push_constants]));
+    renderpass.set_push_constants(wgpu::ShaderStage::VERTEX | wgpu::ShaderStage::FRAGMENT, 0, bytemuck::cast_slice(&[push_constants]));
     renderpass.pop_debug_group();
     renderpass.insert_debug_marker("Drawing frame");
     renderpass.draw_indexed(0..index_cnt as u32, 0, 0..1);
@@ -758,6 +794,7 @@ fn main() {
     let (vertex_buf,
          index_buf,
          index_count,
+         _mandelbrot_extent,
          _mandelbrot_texture,
          mandelbrot_view,
          mandelbrot_sampler
@@ -794,13 +831,17 @@ fn main() {
         last_frame: std::time::Instant::now(),
         show_demo: false,
         last_cursor: None,
+        extent: extent,
+        camera_count: texture_count as u32,
         scene_camera: 0,
         viewport_camera: 1, 
-        zoom: 0.1,
+        viewport_scale: 0.15,
+        zoom: 1.0,
         offset: [0.0, 0.0],
         texture_id: imgui_texture_id,
     };
-
+    drop(extent);
+    
     log::info!("Starting event loop!");
     let (_pool, spawner) = {
         let local_pool = futures::executor::LocalPool::new();
@@ -834,7 +875,7 @@ fn main() {
                 ..
             } => {
                 let size = window.inner_size();
-                let extent = wgpu::Extent3d {
+                ui_state.extent = wgpu::Extent3d {
                     width: size.width,
                     height: size.height,
                     depth: 1,
@@ -847,12 +888,18 @@ fn main() {
                     &mut camera_list,
                     &camera_buf,
                     &position_list,
-                    extent,
+                    ui_state.extent,
+                );
+                imgui_resize_texture(
+                    &h.device,
+                    &mut imgui_renderer,
+                    ui_state.extent,
+                    imgui_texture_id
                 );
                 let (new_target_list, new_target_view_list) = init_render_targets(
                     &h.device,
                     texture_count,
-                    extent,
+                    ui_state.extent,
                     swapchain_desc.format,
                     msaa_samples
                 );
@@ -864,16 +911,45 @@ fn main() {
                 WindowEvent::KeyboardInput {
                     input:
                         KeyboardInput {
-                            virtual_keycode: Some(VirtualKeyCode::Escape),
+                            virtual_keycode: Some(virtual_code),
                             state: ElementState::Pressed,
                             ..
                         },
                     ..
+                } => match virtual_code {
+                    VirtualKeyCode::W => {
+                        position_list[ui_state.scene_camera as usize] 
+                            += cgmath::Vector3::unit_x();
+                    }
+                    VirtualKeyCode::S => {
+                        position_list[ui_state.scene_camera as usize] 
+                            -= cgmath::Vector3::unit_x();
+                    }
+                    VirtualKeyCode::A => {
+                        position_list[ui_state.scene_camera as usize] 
+                            -= cgmath::Vector3::unit_y();
+                    }
+                    VirtualKeyCode::D => {
+                        position_list[ui_state.scene_camera as usize] 
+                            += cgmath::Vector3::unit_y();
+                    }
+                    VirtualKeyCode::Q => {
+                        position_list[ui_state.scene_camera as usize] 
+                            += cgmath::Vector3::unit_z();
+                    }
+                    VirtualKeyCode::E => {
+                        position_list[ui_state.scene_camera as usize] 
+                            -= cgmath::Vector3::unit_z();
+                    }
+                    VirtualKeyCode::Escape => {
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    _ => {}
                 }
-                | WindowEvent::CloseRequested => {
+                WindowEvent::CloseRequested => {
                     *control_flow = ControlFlow::Exit;
                 }
-                _ => {}
+                _=>{}
             },
             Event::RedrawRequested(_) => {
                 let now = Instant::now();
@@ -897,7 +973,7 @@ fn main() {
                     &mut camera_list,
                     &camera_buf,
                     &position_list,
-                    extent
+                    ui_state.extent,
                 );
 
                 // Render Scene
@@ -911,13 +987,13 @@ fn main() {
                     &vertex_buf,
                     &index_buf,
                     index_count,
-                    push_constant(ui_state.zoom, ui_state.offset),
+                    push_constant(ui_state.zoom, ui_state.offset, ui_state.scene_camera),
                     &spawner
                 );
 
                 // Render viewport 
                 render(
-                    &target_view_list[ui_state.scene_camera as usize],
+                    &target_view_list[ui_state.viewport_camera as usize],
                     &imgui_renderer
                         .textures
                         .get(imgui_texture_id)
@@ -930,7 +1006,7 @@ fn main() {
                     &vertex_buf,
                     &index_buf,
                     index_count,
-                    push_constant(ui_state.zoom, ui_state.offset),
+                    push_constant(ui_state.zoom, ui_state.offset, ui_state.viewport_camera),
                     &spawner
                 );
                 // Render UI
