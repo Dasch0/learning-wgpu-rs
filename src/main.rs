@@ -1094,13 +1094,14 @@ fn main() {
                             -= cgmath::Vector3::unit_z();
                     }
                     VirtualKeyCode::C => {
-                       let future = create_png(
-                           "capture.png",
-                           &h.device,
-                           &capture_buffer,
-                           &capture_dimension
-                       );
-                       futures::executor::block_on(future);
+                        log::info!("Printing Capture...");
+                        let future = create_png(
+                            "capture.png",
+                            &h.device,
+                            &capture_buffer,
+                            &capture_dimension
+                        );
+                        futures::executor::block_on(future);
                     }
                     
                     VirtualKeyCode::Escape => {
