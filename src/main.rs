@@ -1,3 +1,4 @@
+use std::io::Write;
 use rayon::prelude::*;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -76,28 +77,28 @@ fn push_constant(zoom: f32, offset: [f32; 2], camera_index: u32) -> PushConstant
     }
 }
 
-//struct BufferDimensions {
-//    width: usize,
-//    height: usize,
-//    _unpadded_bytes_per_row: usize,
-//    padded_bytes_per_row: usize,
-//}
-//
-//impl BufferDimensions {
-//    fn new(width: usize, height: usize) -> Self {
-//        let bytes_per_pixel = std::mem::size_of::<u32>();
-//        let unpadded_bytes_per_row = width * bytes_per_pixel;
-//        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
-//        let padded_bytes_per_row_padding = (align - unpadded_bytes_per_row % align) % align;
-//        let padded_bytes_per_row = unpadded_bytes_per_row + padded_bytes_per_row_padding;
-//        Self {
-//            width,
-//            height,
-//            _unpadded_bytes_per_row: unpadded_bytes_per_row,
-//            padded_bytes_per_row,
-//        }
-//    }
-//}
+struct BufferDimensions {
+    width: usize,
+    height: usize,
+    unpadded_bytes_per_row: usize,
+    padded_bytes_per_row: usize,
+}
+
+impl BufferDimensions {
+    fn new(width: usize, height: usize) -> Self {
+        let bytes_per_pixel = std::mem::size_of::<u32>();
+        let unpadded_bytes_per_row = width * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+        let padded_bytes_per_row_padding = (align - unpadded_bytes_per_row % align) % align;
+        let padded_bytes_per_row = unpadded_bytes_per_row + padded_bytes_per_row_padding;
+        Self {
+            width: width,
+            height,
+            unpadded_bytes_per_row: unpadded_bytes_per_row,
+            padded_bytes_per_row,
+        }
+    }
+}
 
 fn create_test_mesh() -> (Vec<Vertex>, Vec<u16>) {
     let vertex_data = [
@@ -389,6 +390,34 @@ fn init_scene_config(
     (scene_bind_group_layout, scene_pipeline_layout, scene_pipeline)
 }
 
+fn init_capture_targets(
+    device: &wgpu::Device,
+    extent: wgpu::Extent3d
+) -> (wgpu::Texture, wgpu::TextureView, BufferDimensions, wgpu::Buffer) {
+    // Capture Texture & Buffer
+    let capture_texture = device.create_texture(&wgpu::TextureDescriptor {
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
+        label: Some("Capture texture"),
+    });
+    let capture_view = capture_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let capture_dimension =
+        BufferDimensions::new(extent.width as usize, extent.height as usize);
+
+    let capture_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Capture Buffer"),
+        size: (capture_dimension.padded_bytes_per_row * capture_dimension.height) as u64,
+        usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    (capture_texture, capture_view, capture_dimension, capture_buffer)
+}
+
 fn init_scene_data(
     device: &wgpu::Device,
     queue: &wgpu::Queue
@@ -505,7 +534,8 @@ fn init_imgui(
     let imgui_texture_config = imgui_wgpu::TextureConfig::new(
         texture_extent.width,
         texture_extent.height
-    ).set_usage(wgpu::TextureUsage::COPY_DST
+    ).set_usage(wgpu::TextureUsage::COPY_SRC
+                | wgpu::TextureUsage::COPY_DST
                 | wgpu::TextureUsage::SAMPLED
                 | wgpu::TextureUsage::OUTPUT_ATTACHMENT
     );
@@ -533,33 +563,32 @@ fn imgui_build_ui(ui: &imgui::Ui, state: &mut UiState) {
                 mouse_pos[0],
                 mouse_pos[1],
             ));
-
             ui.separator();
             if ui.button(im_str!("Toggle Demo"), [100., 20.]) {
                 state.show_demo = !state.show_demo
             }
             ui.separator();
-            imgui::Slider::new(im_str!("Scene Camera"))
+            imgui::Slider::new(im_str!("Set Scene Camera"))
                 .range(0..=state.camera_count-1)
                 .build(&ui, &mut state.scene_camera );
             ui.separator();
-            imgui::Slider::new(im_str!("Viewport Camera"))
+            imgui::Slider::new(im_str!("Set Viewport Camera"))
                 .range(0..=state.camera_count-1)
                 .build(&ui, &mut state.viewport_camera);
             ui.separator();
-            imgui::Slider::new(im_str!("Texture Zoom"))
+            imgui::Slider::new(im_str!("Set Texture Zoom"))
                 .range(0.001..=1.0)
                 .build(&ui, &mut state.zoom);
             ui.separator();
-            imgui::Slider::new(im_str!("Texture X offset"))
+            imgui::Slider::new(im_str!("Set Texture X offset"))
                 .range(0.00..=1.0)
                 .build(&ui, &mut state.offset[0]);
             ui.separator();
-            imgui::Slider::new(im_str!("Texture Y offset"))
+            imgui::Slider::new(im_str!("Set Texture Y offset"))
                 .range(0.00..=1.0)
                 .build(&ui, &mut state.offset[1]);
             ui.separator();
-            imgui::Slider::new(im_str!("ViewPort scale"))
+            imgui::Slider::new(im_str!("Set Viewport scale"))
                 .range(0.001..=1.0)
                 .build(&ui, &mut state.viewport_scale);
             imgui::Image::new(state.texture_id, [
@@ -567,6 +596,21 @@ fn imgui_build_ui(ui: &imgui::Ui, state: &mut UiState) {
                 state.extent.height as f32 * state.viewport_scale
             ]).build(&ui);
             ui.separator();
+        });
+
+    let control_window = imgui::Window::new(im_str!("Controls"));
+    control_window
+        .size([500.0, 200.0], imgui::Condition::FirstUseEver)
+        .build(ui, || {
+            ui.text(im_str!("W : move camera along positive x axis"));
+            ui.text(im_str!("A : move camera along negative y axis"));
+            ui.text(im_str!("S : move camera along negative x axis"));
+            ui.text(im_str!("D : move camera along positive y axis"));
+            ui.text(im_str!("Q : move camera along positive z axis"));
+            ui.text(im_str!("E : move camera along negative z axis"));
+            ui.separator();
+            ui.text(im_str!("C : capture viewport texture as .png"));
+            ui.text(im_str!("ESC : quit"));
         });
     
     if state.show_demo {
@@ -584,7 +628,8 @@ fn imgui_resize_texture(
     let imgui_texture_config = imgui_wgpu::TextureConfig::new(
         extent.width,
         extent.height
-    ).set_usage(wgpu::TextureUsage::COPY_DST
+    ).set_usage(wgpu::TextureUsage::COPY_SRC
+                | wgpu::TextureUsage::COPY_DST
                 | wgpu::TextureUsage::SAMPLED
                 | wgpu::TextureUsage::OUTPUT_ATTACHMENT
     );
@@ -745,6 +790,90 @@ fn render<T:Pod>(
     queue.submit(Some(encoder.finish()));
 }
 
+fn capture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    extent: wgpu::Extent3d,
+    output_buffer: &wgpu::Buffer,
+    buffer_dimension: &BufferDimensions)
+{
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Capture Command")
+    });
+
+    encoder.copy_texture_to_buffer(
+        wgpu::TextureCopyView {
+            texture: texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+        },
+        wgpu::BufferCopyView {
+            buffer: &output_buffer,
+            layout: wgpu::TextureDataLayout {
+                offset: 0,
+                bytes_per_row: buffer_dimension.padded_bytes_per_row as u32, 
+                rows_per_image: 0,
+            },
+        },
+        extent,
+    );
+    let command_buffer = encoder.finish();
+    queue.submit(Some(command_buffer));
+}
+
+async fn create_png(
+    png_output_path: &str,
+    device: &wgpu::Device,
+    output_buffer: &wgpu::Buffer,
+    buffer_dimension: &BufferDimensions,
+) {
+    // Note that we're not calling `.await` here.
+    let buffer_slice = output_buffer.slice(..);
+    let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+
+    // Poll the device in a blocking manner so that our future resolves.
+    // In an actual application, `device.poll(...)` should
+    // be called in an event loop or on another thread.
+    device.poll(wgpu::Maintain::Wait);
+    // If a file system is available, write the buffer as a PNG
+    let has_file_system_available = cfg!(not(target_arch = "wasm32"));
+    if !has_file_system_available {
+        return;
+    }
+
+    if let Ok(()) = buffer_future.await {
+        let padded_buffer = buffer_slice.get_mapped_range();
+
+        let mut png_encoder = png::Encoder::new(
+            std::fs::File::create(png_output_path).unwrap(),
+            buffer_dimension.width as u32,
+            buffer_dimension.height as u32,
+        );
+        png_encoder.set_depth(png::BitDepth::Eight);
+        png_encoder.set_color(png::ColorType::RGBA);
+        let mut png_writer = png_encoder
+            .write_header()
+            .unwrap()
+            .into_stream_writer_with_size(buffer_dimension.unpadded_bytes_per_row);
+
+        // from the padded_buffer we write just the unpadded bytes into the image
+        for chunk in padded_buffer.chunks(buffer_dimension.padded_bytes_per_row) {
+            png_writer
+                .write(&chunk[..buffer_dimension.unpadded_bytes_per_row])
+                .unwrap();
+        }
+        png_writer.finish().unwrap();
+
+        // With the current interface, we have to make sure all mapped views are
+        // dropped before we unmap the buffer.
+        drop(padded_buffer);
+
+        output_buffer.unmap();
+    }
+}
+
 fn main() {
     // Init Window
     env_logger::init();
@@ -759,6 +888,15 @@ fn main() {
 
     // Device, Queue, Surface 
     let h = futures::executor::block_on(init_gpu(&window));
+
+    let (vertex_buf,
+         index_buf,
+         index_count,
+         _mandelbrot_extent,
+         _mandelbrot_texture,
+         mandelbrot_view,
+         mandelbrot_sampler
+    ) = init_scene_data(&h.device, &h.queue); 
 
     // Swapchain
     let (swapchain_desc, mut swapchain) = build_swapchain(&h.device, &h.surface, h.size);
@@ -777,6 +915,13 @@ fn main() {
         msaa_samples
     );
 
+    // Capture Targets
+    let (mut capture_texture,
+         mut capture_view,
+         mut capture_dimension,
+         mut capture_buffer
+    ) = init_capture_targets(&h.device, extent);
+
     // UI
     let (mut imgui_context,
          mut imgui_platform,
@@ -789,16 +934,6 @@ fn main() {
          _pipeline_layout,
          pipeline
     ) = init_scene_config(&h.device, swapchain_desc.format, msaa_samples);
-
-    // Scene Data
-    let (vertex_buf,
-         index_buf,
-         index_count,
-         _mandelbrot_extent,
-         _mandelbrot_texture,
-         mandelbrot_view,
-         mandelbrot_sampler
-    ) = init_scene_data(&h.device, &h.queue); 
 
     // Cameras
     let (mut camera_list,
@@ -882,7 +1017,11 @@ fn main() {
                 };
 
                 log::info!("Resizing to {:?}", size);
+            
+                // Swapchain
                 build_swapchain(&h.device, &h.surface, size);
+                
+                // Cameras
                 update_camera_list(
                     &h.queue,
                     &mut camera_list,
@@ -890,6 +1029,8 @@ fn main() {
                     &position_list,
                     ui_state.extent,
                 );
+
+                // Render Targets
                 imgui_resize_texture(
                     &h.device,
                     &mut imgui_renderer,
@@ -905,6 +1046,17 @@ fn main() {
                 );
                 _target_list = new_target_list;
                 target_view_list = new_target_view_list;
+
+                // Capture Targets
+                let (new_capture_texture,
+                     new_capture_view,
+                     new_capture_dimension,
+                     new_capture_buffer
+                ) = init_capture_targets(&h.device, ui_state.extent);
+                capture_texture = new_capture_texture;
+                capture_view = new_capture_view;
+                capture_dimension = new_capture_dimension;
+                capture_buffer = new_capture_buffer;
             }
             
             Event::WindowEvent {ref event, .. } => match event {
@@ -941,6 +1093,16 @@ fn main() {
                         position_list[ui_state.scene_camera as usize] 
                             -= cgmath::Vector3::unit_z();
                     }
+                    VirtualKeyCode::C => {
+                       let future = create_png(
+                           "capture.png",
+                           &h.device,
+                           &capture_buffer,
+                           &capture_dimension
+                       );
+                       futures::executor::block_on(future);
+                    }
+                    
                     VirtualKeyCode::Escape => {
                         *control_flow = ControlFlow::Exit;
                     }
@@ -955,6 +1117,58 @@ fn main() {
                 let now = Instant::now();
                 imgui_context.io_mut().update_delta_time(now - ui_state.last_frame);
                 ui_state.last_frame = now;
+                
+                let size = window.inner_size();
+                if ui_state.extent.width != size.width {
+                    ui_state.extent = wgpu::Extent3d {
+                        width: size.width,
+                        height: size.height,
+                        depth: 1,
+                    };
+
+                    log::info!("Resizing to {:?}", size);
+                
+                    // Swapchain
+                    build_swapchain(&h.device, &h.surface, size);
+                    
+                    // Cameras
+                    update_camera_list(
+                        &h.queue,
+                        &mut camera_list,
+                        &camera_buf,
+                        &position_list,
+                        ui_state.extent,
+                    );
+
+                    // Render Targets
+                    imgui_resize_texture(
+                        &h.device,
+                        &mut imgui_renderer,
+                        ui_state.extent,
+                        imgui_texture_id
+                    );
+                    let (new_target_list, new_target_view_list) = init_render_targets(
+                        &h.device,
+                        texture_count,
+                        ui_state.extent,
+                        swapchain_desc.format,
+                        msaa_samples
+                    );
+                    _target_list = new_target_list;
+                    target_view_list = new_target_view_list;
+
+                    // Capture Targets
+                    let (new_capture_texture,
+                         new_capture_view,
+                         new_capture_dimension,
+                         new_capture_buffer
+                    ) = init_capture_targets(&h.device, ui_state.extent);
+                    capture_texture = new_capture_texture;
+                    capture_view = new_capture_view;
+                    capture_dimension = new_capture_dimension;
+                    capture_buffer = new_capture_buffer;
+                }
+
                 let frame = match swapchain.get_current_frame() { Ok(frame) => frame,
                     Err(e) => {
                         log::warn!("dropped frame: {:?}", e);
@@ -1009,6 +1223,7 @@ fn main() {
                     push_constant(ui_state.zoom, ui_state.offset, ui_state.viewport_camera),
                     &spawner
                 );
+                
                 // Render UI
                 imgui_platform
                     .prepare_frame(imgui_context.io_mut(), &window)
@@ -1025,6 +1240,29 @@ fn main() {
                     ui,
                     &mut ui_state,
                     &frame.output.view
+                );
+
+                render(
+                    &target_view_list[ui_state.viewport_camera as usize],
+                    &capture_view,
+                    &h.device,
+                    &h.queue,
+                    &pipeline,
+                    &scene_bind_group,
+                    &vertex_buf,
+                    &index_buf,
+                    index_count,
+                    push_constant(ui_state.zoom, ui_state.offset, ui_state.viewport_camera),
+                    &spawner
+                );
+                
+                capture(
+                    &h.device,
+                    &h.queue,
+                    &capture_texture,
+                    ui_state.extent,
+                    &capture_buffer,
+                    &capture_dimension,
                 );
            }
             _ => {}
