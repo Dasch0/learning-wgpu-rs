@@ -409,7 +409,7 @@ fn init_scene_data(
         usage: wgpu::BufferUsage::INDEX,
     });
 
-    let size = 15000u32;
+    let size = 2048u32;
     let texels = create_mandelbrot_texture(size as usize);
     let texture_extent = wgpu::Extent3d {
         width: size,
